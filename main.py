@@ -16,6 +16,7 @@ import base64
 import gc
 import json
 import logging
+from pathlib import Path
 import re
 import secrets
 import time
@@ -756,19 +757,38 @@ def _load_packages_cache():
     from config.settings import BASE_DIR
     import json
 
+    def _load_json_from_candidates(filename: str) -> list[dict]:
+        candidates = [
+            BASE_DIR.parent / "assets" / filename,
+            BASE_DIR / "assets" / filename,
+            Path.cwd() / "assets" / filename,
+        ]
+
+        for candidate in candidates:
+            try:
+                if candidate.exists():
+                    with open(candidate, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    logger.info("Loaded %s entries from %s",
+                                len(data), candidate)
+                    return data
+            except Exception as exc:
+                logger.warning("Failed loading %s from %s: %s",
+                               filename, candidate, exc)
+
+        logger.warning("Could not locate %s in any known asset path", filename)
+        return []
+
     try:
-        pkg_path = BASE_DIR.parent / "assets" / "maa_packages.json"
-        with open(pkg_path, "r", encoding="utf-8") as f:
-            _packages_cache = json.load(f)
+        _packages_cache = _load_json_from_candidates("maa_packages.json")
         logger.info(f"Loaded {len(_packages_cache)} standard packages")
     except Exception as e:
         logger.warning(f"Failed to load packages: {e}")
         _packages_cache = []
 
     try:
-        rob_path = BASE_DIR.parent / "assets" / "maa_robotic_surgeries.json"
-        with open(rob_path, "r", encoding="utf-8") as f:
-            _robotic_cache = json.load(f)
+        _robotic_cache = _load_json_from_candidates(
+            "maa_robotic_surgeries.json")
         logger.info(f"Loaded {len(_robotic_cache)} robotic packages")
     except Exception as e:
         logger.warning(f"Failed to load robotic packages: {e}")
@@ -1740,6 +1760,11 @@ async def start_interactive_search(request: InteractiveSearchStartRequest):
     if not matching_packages:
         _load_packages_cache()
         all_pkgs = _packages_cache + _robotic_cache
+        if not all_pkgs:
+            raise HTTPException(
+                503,
+                "Package datasets are not loaded on server. Ensure assets/maa_packages.json and assets/maa_robotic_surgeries.json are present.",
+            )
         mapped_specs = get_specialties_for_term(main_term)
         if mapped_specs:
             spec_matches = []
