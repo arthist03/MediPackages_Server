@@ -402,9 +402,21 @@ def generate_package_options(
         })
 
         if len(options) >= 15:
-            return options[:15]
+            break
 
-    return options[:15]
+    options = options[:15]
+    options.append({
+        "id": "manual_add_main",
+        "code": "",
+        "label": "Add Manually from Normal Search",
+        "description": "Open normal search, select the exact main package, then return to continue smart flow.",
+        "specialty": "Manual",
+        "rate": None,
+        "rank": 9999,
+        "reasoning": "Use when expected package is not listed",
+    })
+
+    return options
 
 
 def generate_implant_options(
@@ -511,6 +523,7 @@ def generate_addon_options(
                     "description": str(pkg.get("PACKAGE NAME", "")),
                     "specialty": str(pkg.get("SPECIALITY", "")),
                     "rate": pkg.get("RATE", 0),
+                    "rank": len(options) + 1,
                     "reason": f"Direct match for: {addon_term}",
                 })
                 seen_codes.add(code)
@@ -539,6 +552,7 @@ def generate_addon_options(
                     "description": str(pkg.get("PACKAGE NAME", "")),
                     "specialty": str(pkg.get("SPECIALITY", "")),
                     "rate": pkg.get("RATE", 0),
+                    "rank": len(options) + 1,
                     "reason": f"Supportive suggestion for: {addon_term}",
                 })
                 seen_codes.add(code)
@@ -555,10 +569,28 @@ def generate_addon_options(
             "description": "Continue with only the selected main package.",
             "specialty": "Optional",
             "rate": 0,
+            "rank": 9998,
             "reason": "User can choose to skip this suggestion",
         })
 
-    return options[:9]
+    options.append({
+        "id": "manual_add_addon",
+        "code": "",
+        "label": "Add Add-on Manually from Normal Search",
+        "description": "Open normal search, select required add-on, and continue smart flow.",
+        "specialty": "Manual",
+        "rate": None,
+        "rank": 9999,
+        "reason": "Use when required add-on is not listed",
+    })
+
+    # Keep manual-add option available even when list is capped.
+    manual_option = next(
+        (o for o in options if o.get("id") == "manual_add_addon"), None)
+    limited = [o for o in options if o.get("id") != "manual_add_addon"][:9]
+    if manual_option:
+        limited.append(manual_option)
+    return limited
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -795,17 +827,45 @@ def process_step_selection(
     if not selected_option:
         return False, "Invalid selection"
 
+    # Manual add path: user selected placeholder option and submitted a package from normal search.
+    if selected_id.startswith("manual_add"):
+        manual_pkg = selection.get("manual_package") or {}
+        manual_code = str(manual_pkg.get("code", "")).strip()
+        manual_name = str(manual_pkg.get("name", "")).strip()
+        if not manual_code or not manual_name:
+            return False, "Manual package details are missing"
+
+        rate_value = manual_pkg.get("rate", 0)
+        try:
+            parsed_rate = float(rate_value)
+        except Exception:
+            parsed_rate = 0.0
+
+        is_main_step = current_step.step_number == 2 or "main package" in current_step.step_name.lower()
+        normalized_id = f"package_{manual_code}" if is_main_step else f"addon_{manual_code}"
+
+        selected_option = {
+            "id": normalized_id,
+            "code": manual_code,
+            "label": f"[{manual_code}] {manual_name[:90]}",
+            "description": manual_name,
+            "specialty": str(manual_pkg.get("specialty", "")),
+            "rate": parsed_rate,
+            "reason": "Added manually from normal search",
+            "is_manual": True,
+        }
+
     # Store selection
     flow.set_selection(flow.current_step, selected_option)
 
     # If procedure/specialty is selected in step 1, refine step 2 package options.
     if current_step.step_number == 1 and flow.current_step + 1 < len(flow.steps):
-        from tools.medical_knowledge import get_specialties_for_term
+        from tools.medical_knowledge import get_specialties_for_term, get_clinical_pathway
 
         generic_tokens = {
             "surgery", "surgical", "procedure", "management", "operation",
             "approach", "general", "specialty", "select", "main", "package",
-            "phase", "stage", "level", "type",
+            "phase", "stage", "level", "type", "pain", "ache", "discomfort", "symptom", "disease",
         }
 
         def _tokenize(text: str) -> List[str]:
@@ -823,8 +883,21 @@ def process_step_selection(
             "label") or selected_option.get("specialty") or ""
         query_tokens = _tokenize(flow.query)
         hint_tokens = _tokenize(selected_hint)
+
         mapped_specs = {s.lower().strip()
                         for s in get_specialties_for_term(flow.query)}
+        pathway = get_clinical_pathway(flow.query)
+        if pathway and pathway.get("steps"):
+            for step in pathway.get("steps", []):
+                step_spec = str(step.get("specialty", "")).strip().lower()
+                if step_spec:
+                    mapped_specs.add(step_spec)
+
+        symptom_query_indicators = {
+            "pain", "fever", "breath", "cough", "bleeding", "swelling", "weakness", "dizziness", "attack",
+        }
+        strict_intent_query = bool(mapped_specs) and any(
+            ind in flow.query.lower() for ind in symptom_query_indicators)
 
         # Keep diagnosis anchors first, then selected non-generic hints.
         combined_tokens: List[str] = []
@@ -852,6 +925,9 @@ def process_step_selection(
                 continue
 
             score = (query_hits * 8) + (hint_hits * 4) + (spec_hit * 6)
+            if strict_intent_query and spec_hit == 0:
+                continue
+
             if score > 0:
                 scored_candidates.append((score, pkg))
 

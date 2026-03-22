@@ -253,6 +253,7 @@ class SearchOption(BaseModel):
     code: Optional[str] = None
     rate: Optional[float] = None
     reasoning: Optional[str] = None
+    rank: Optional[int] = None
 
 
 class SearchStepResponse(BaseModel):
@@ -284,6 +285,7 @@ class InteractiveSearchStartResponse(BaseModel):
 class SelectionRequest(BaseModel):
     option_id: str
     notes: Optional[str] = None
+    manual_package: Optional[dict] = None
 
 
 class SelectionResponse(BaseModel):
@@ -302,6 +304,31 @@ class FlowStatusResponse(BaseModel):
     selections_made: dict
     violations: list[str] = []
     flow_complete: bool
+
+
+def _auto_advance_single_option_steps(flow: Any, packages: List[Dict]) -> None:
+    """Auto-select steps that have only one non-manual option to reduce unnecessary taps."""
+    from tools.smart_search_flow import process_step_selection
+
+    safety_counter = 0
+    while not flow.flow_complete and flow.current_step < len(flow.steps):
+        if safety_counter > 20:
+            break
+        safety_counter += 1
+
+        step = flow.steps[flow.current_step]
+        options = step.options or []
+        if len(options) != 1:
+            break
+
+        only_opt = options[0]
+        opt_id = str(only_opt.get("id", ""))
+        if opt_id.startswith("manual_add"):
+            break
+
+        success, _ = process_step_selection(flow, {"id": opt_id}, packages)
+        if not success:
+            break
 
 
 # ── Helper ─────────────────────────────────────────────────────────────
@@ -765,7 +792,8 @@ def _search_packages_basic(query: str, limit: int = 50) -> list[dict]:
     query_lower = _normalize_search_text(query)
     terms = re.findall(r"[a-z0-9]+", query_lower)
     generic_terms = {
-        "surgery", "surgical", "procedure", "management", "treatment", "operation", "package"
+        "surgery", "surgical", "procedure", "management", "treatment", "operation", "package",
+        "pain", "ache", "discomfort", "symptom", "disease",
     }
     filtered_terms = [t for t in terms if t not in generic_terms]
     if not filtered_terms:
@@ -789,8 +817,41 @@ def _search_packages_basic(query: str, limit: int = 50) -> list[dict]:
             return keyword in text
         return any(tok == keyword or tok.startswith(keyword) for tok in tokens)
 
+    def _normalize_words(value: str) -> str:
+        cleaned = " ".join((value or "").lower().replace(
+            "/", " ").replace("-", " ").split())
+        return f" {cleaned} "
+
+    from tools.medical_knowledge import get_specialties_for_term, get_clinical_pathway
+    intent_specialties = {s.lower().strip()
+                          for s in get_specialties_for_term(query_lower)}
+    pathway = get_clinical_pathway(query_lower)
+    if pathway:
+        pathway_specialty = pathway.get("specialty")
+        if isinstance(pathway_specialty, list):
+            for spec in pathway_specialty:
+                spec_norm = str(spec).strip().lower()
+                if spec_norm:
+                    intent_specialties.add(spec_norm)
+        elif isinstance(pathway_specialty, str):
+            spec_norm = pathway_specialty.strip().lower()
+            if spec_norm:
+                intent_specialties.add(spec_norm)
+
+        for step in pathway.get("steps", []):
+            step_spec = str(step.get("specialty", "")).strip().lower()
+            if step_spec:
+                intent_specialties.add(step_spec)
+
+    symptom_query_indicators = {
+        "pain", "fever", "breath", "cough", "bleeding", "swelling", "weakness", "dizziness", "attack",
+    }
+    strict_intent_query = bool(intent_specialties) and any(
+        ind in query_lower for ind in symptom_query_indicators)
+
     # Expand search terms with medical synonyms and related terms
     expanded_terms = set(filtered_terms)
+    active_related_terms = set()
     SYMPTOM_EXPANSIONS = {
         "chest pain": ["coronary", "angiography", "cardiac", "heart", "ptca", "cabg", "thrombolysis", "mi"],
         "heart attack": ["mi", "myocardial", "thrombolysis", "ptca", "coronary", "stemi", "nstemi", "cabg"],
@@ -821,6 +882,7 @@ def _search_packages_basic(query: str, limit: int = 50) -> list[dict]:
     for symptom, related in SYMPTOM_EXPANSIONS.items():
         if symptom in query_lower or any(t in symptom for t in filtered_terms):
             expanded_terms.update(related)
+            active_related_terms.update(related)
 
     PHRASE_PRIORITY = {
         "angioplasty": ["ptca", "coronary angioplasty", "coronary", "angioplasty", "pci"],
@@ -917,6 +979,23 @@ def _search_packages_basic(query: str, limit: int = 50) -> list[dict]:
         for trigger, spec_hints in CONDITION_SPECIALTY_HINTS.items():
             if trigger in query_lower and not any(_has_keyword(h, spec, spec_tokens) for h in spec_hints):
                 score -= 8
+
+        # Generic symptom-intent anchoring: for symptom-like queries, prefer packages matching inferred specialties.
+        spec_norm = _normalize_words(spec)
+        spec_matches_intent = any(_normalize_words(
+            s) in spec_norm for s in intent_specialties)
+        related_match = any(
+            _has_term(rel, name, name_tokens)
+            or _has_term(rel, spec, spec_tokens)
+            or _has_term(rel, code, code_tokens)
+            for rel in active_related_terms
+        )
+        if spec_matches_intent:
+            score += 10
+        elif strict_intent_query:
+            score -= 18
+            if not related_match:
+                continue
 
         # Keep angioplasty refinement as secondary to generic direct-match ordering.
         if "angioplasty" in query_lower and "peripheral" not in query_lower:
@@ -1689,6 +1768,7 @@ async def start_interactive_search(request: InteractiveSearchStartRequest):
         all_packages_for_addons=all_packages,
     )
     advance_past_empty_optional_steps(flow)
+    _auto_advance_single_option_steps(flow, all_packages)
 
     # Store flow session
     session_id = str(uuid.uuid4())
@@ -1708,7 +1788,8 @@ async def start_interactive_search(request: InteractiveSearchStartRequest):
     }
 
     # Get first step
-    first_step = flow.steps[0] if flow.steps else None
+    first_step = flow.steps[flow.current_step] if flow.steps and flow.current_step < len(
+        flow.steps) else None
     if not first_step:
         raise HTTPException(500, "Failed to build search flow")
 
@@ -1725,6 +1806,7 @@ async def start_interactive_search(request: InteractiveSearchStartRequest):
                 code=opt.get("code"),
                 rate=opt.get("rate"),
                 reasoning=opt.get("reasoning"),
+                rank=opt.get("rank"),
             )
             for opt in first_step.options
         ],
@@ -1749,8 +1831,11 @@ async def get_current_step(session_id: str):
 
     session_data = _interactive_flows[session_id]
     flow = session_data["flow"]
+    packages = session_data.get(
+        "all_packages") or session_data.get("packages", [])
     from tools.smart_search_flow import advance_past_empty_optional_steps
     advance_past_empty_optional_steps(flow)
+    _auto_advance_single_option_steps(flow, packages)
 
     if flow.flow_complete:
         return {
@@ -1776,6 +1861,8 @@ async def get_current_step(session_id: str):
                 "specialty": opt.get("specialty"),
                 "code": opt.get("code"),
                 "rate": opt.get("rate"),
+                "reasoning": opt.get("reasoning") or opt.get("reason"),
+                "rank": opt.get("rank"),
             }
             for opt in current_step.options
         ],
@@ -1807,7 +1894,11 @@ async def submit_step_selection(session_id: str, selection: SelectionRequest):
 
     success, error = process_step_selection(
         flow,
-        {"id": selection.option_id},
+        {
+            "id": selection.option_id,
+            "notes": selection.notes,
+            "manual_package": selection.manual_package,
+        },
         packages,
     )
 
@@ -1818,6 +1909,9 @@ async def submit_step_selection(session_id: str, selection: SelectionRequest):
             next_step=None,
             flow_complete=False,
         )
+
+    # Auto-progress any subsequent single-option steps.
+    _auto_advance_single_option_steps(flow, packages)
 
     # If flow is complete, build final recommendation
     if flow.flow_complete:
@@ -1856,6 +1950,8 @@ async def submit_step_selection(session_id: str, selection: SelectionRequest):
                 specialty=opt.get("specialty"),
                 code=opt.get("code"),
                 rate=opt.get("rate"),
+                reasoning=opt.get("reasoning") or opt.get("reason"),
+                rank=opt.get("rank"),
             )
             for opt in next_step.options
         ],
