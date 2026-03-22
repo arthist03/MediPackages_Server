@@ -636,13 +636,21 @@ def get_specialties_for_term(term: str) -> List[str]:
     term_lower = term.lower()
     specialties = set()
 
+    def _normalize_words(value: str) -> str:
+        cleaned = " ".join(value.lower().replace(
+            "/", " ").replace("-", " ").split())
+        return f" {cleaned} "
+
+    term_norm = _normalize_words(term_lower)
+
     # Direct lookup
     if term_lower in SPECIALTY_MAPPING:
         specialties.update(SPECIALTY_MAPPING[term_lower])
 
     # Check if term contains any mapped keyword
     for keyword, specs in SPECIALTY_MAPPING.items():
-        if keyword in term_lower or term_lower in keyword:
+        keyword_norm = _normalize_words(keyword)
+        if keyword_norm in term_norm:
             specialties.update(specs)
 
     # Check synonyms

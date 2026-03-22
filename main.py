@@ -16,11 +16,12 @@ import base64
 import gc
 import json
 import logging
+import re
 import secrets
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 from fastapi import FastAPI, File, HTTPException, UploadFile, Depends, Security, Request
 from fastapi.security.api_key import APIKeyHeader
@@ -64,6 +65,9 @@ MAX_FILE_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 _pipeline = None
 _pending_sessions: dict[str, dict] = {}  # session_id → session data
 SESSION_TTL_SECONDS = 3600  # sessions older than 1h are pruned
+
+# ── Interactive search flow sessions ────────────────────────────────────
+_interactive_flows: dict[str, any] = {}  # session_id → FlowState
 
 
 def _prune_stale_sessions() -> None:
@@ -238,6 +242,66 @@ class SmartSearchResponse(BaseModel):
     doctor_reasoning: str = ""
     raw_packages: list[dict] = []
     approval_likelihood: str = ""  # HIGH, MEDIUM, LOW, REJECTED
+
+
+# ── Interactive Search Flow Models ───────────────────────────────────────
+class SearchOption(BaseModel):
+    id: str
+    label: str
+    description: str
+    specialty: Optional[str] = None
+    code: Optional[str] = None
+    rate: Optional[float] = None
+    reasoning: Optional[str] = None
+
+
+class SearchStepResponse(BaseModel):
+    step_number: int
+    step_name: str
+    description: str
+    options: list[SearchOption]
+    requires_user_selection: bool
+    context: Optional[dict] = None
+
+
+class InteractiveSearchStartRequest(BaseModel):
+    query: str
+    procedure: str = ""
+    disease: str = ""
+    symptoms: list[str] = []
+    patient_age: int = 0
+    patient_gender: str = ""
+
+
+class InteractiveSearchStartResponse(BaseModel):
+    session_id: str
+    query: str
+    parsed_terms: list[str]
+    current_step: SearchStepResponse
+    message: str
+
+
+class SelectionRequest(BaseModel):
+    option_id: str
+    notes: Optional[str] = None
+
+
+class SelectionResponse(BaseModel):
+    success: bool
+    message: str
+    next_step: Optional[SearchStepResponse] = None
+    flow_complete: bool = False
+    final_recommendation: Optional[dict] = None
+
+
+class FlowStatusResponse(BaseModel):
+    session_id: str
+    query: str
+    current_step_number: int
+    total_steps: int
+    selections_made: dict
+    violations: list[str] = []
+    flow_complete: bool
 
 
 # ── Helper ─────────────────────────────────────────────────────────────
@@ -684,17 +748,53 @@ def _load_packages_cache():
         _robotic_cache = []
 
 
+def _normalize_search_text(value: str) -> str:
+    """Normalize free-text terms for stable package matching."""
+    text = (value or "").lower()
+    text = text.replace("appendectomy", "appendicectomy")
+    text = text.replace("gall bladder", "gallbladder")
+    text = text.replace("lap chole", "laparoscopic cholecystectomy")
+    text = text.replace("kidney transplant", "renal transplant")
+    text = text.replace("liver tx", "liver transplant")
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def _search_packages_basic(query: str, limit: int = 50) -> list[dict]:
     """Basic keyword search to pre-filter packages with medical synonym expansion."""
     _load_packages_cache()
-    query_lower = query.lower()
-    terms = query_lower.split()
+    query_lower = _normalize_search_text(query)
+    terms = re.findall(r"[a-z0-9]+", query_lower)
+    generic_terms = {
+        "surgery", "surgical", "procedure", "management", "treatment", "operation", "package"
+    }
+    filtered_terms = [t for t in terms if t not in generic_terms]
+    if not filtered_terms:
+        filtered_terms = terms
+    normalized_query = " ".join(filtered_terms).strip()
+
+    def _tokens(value: str) -> list[str]:
+        return re.findall(r"[a-z0-9]+", value)
+
+    def _has_term(term: str, text: str, tokens: list[str]) -> bool:
+        if not term:
+            return False
+        if " " in term:
+            return term in text
+        return any(tok == term or tok.startswith(term) for tok in tokens)
+
+    def _has_keyword(keyword: str, text: str, tokens: list[str]) -> bool:
+        if not keyword:
+            return False
+        if " " in keyword:
+            return keyword in text
+        return any(tok == keyword or tok.startswith(keyword) for tok in tokens)
 
     # Expand search terms with medical synonyms and related terms
-    expanded_terms = set(terms)
+    expanded_terms = set(filtered_terms)
     SYMPTOM_EXPANSIONS = {
         "chest pain": ["coronary", "angiography", "cardiac", "heart", "ptca", "cabg", "thrombolysis", "mi"],
         "heart attack": ["mi", "myocardial", "thrombolysis", "ptca", "coronary", "stemi", "nstemi", "cabg"],
+        "angioplasty": ["ptca", "coronary", "stent", "cardiology", "pci"],
         "breathlessness": ["heart failure", "cardiac", "pulmonary", "respiratory", "chf"],
         "stomach pain": ["appendix", "gallbladder", "cholecyst", "pancreat", "intestin"],
         "abdominal pain": ["appendix", "gallbladder", "cholecyst", "pancreat", "intestin", "hernia"],
@@ -706,39 +806,124 @@ def _search_packages_basic(query: str, limit: int = 50) -> list[dict]:
         "burn": ["burns", "graft", "debridement", "dressing", "skin", "eschar", "tbsa"],
         "gastric": ["gastric", "gastrectomy", "gastrojejunostomy", "ulcer", "stomach"],
         "blood": ["transfusion", "blood", "component", "packed", "ffp", "platelet"],
+        "appendix": ["appendicitis", "appendicectomy", "appendicular"],
+        "appendicitis": ["appendix", "appendicectomy", "appendicular"],
+        "hernia": ["inguinal", "ventral", "umbilical", "hernia repair"],
+        "cholecystectomy": ["gallbladder", "cholecystitis", "laparoscopic"],
+        "thyroid": ["thyroidectomy", "endocrine", "ent"],
+        "thyroid surgery": ["thyroidectomy", "endocrine", "ent"],
+        "renal transplant": ["kidney transplant", "transplant", "nephrology", "urology"],
+        "kidney transplant": ["renal transplant", "transplant", "nephrology", "urology"],
+        "liver transplant": ["hepatic transplant", "transplant", "surgical gastroenterology", "gastroenterology"],
+        "blood transfusion": ["transfusion", "platelet", "packed", "whole blood", "component"],
     }
 
     for symptom, related in SYMPTOM_EXPANSIONS.items():
-        if symptom in query_lower or any(t in symptom for t in terms):
+        if symptom in query_lower or any(t in symptom for t in filtered_terms):
             expanded_terms.update(related)
+
+    PHRASE_PRIORITY = {
+        "angioplasty": ["ptca", "coronary angioplasty", "coronary", "angioplasty", "pci"],
+        "appendix": ["appendicectomy", "appendicitis", "appendicular", "appendix"],
+        "cholecystectomy": ["cholecystectomy", "gallbladder", "cholecyst"],
+        "hernia": ["hernia", "inguinal", "umbilical", "ventral"],
+        "thyroid": ["thyroid", "thyroidectomy"],
+        "renal transplant": ["renal transplant", "kidney transplant", "transplant"],
+        "liver transplant": ["liver transplant", "hepatic transplant", "transplant"],
+        "blood transfusion": ["blood transfusion", "platelet transfusion", "whole blood", "component"],
+    }
+
+    CONDITION_SPECIALTY_HINTS = {
+        "angioplasty": ["cardiology", "interventional cardiology", "cath lab"],
+        "appendix": ["general surgery", "surgical gastroenterology", "laparoscopic"],
+    }
 
     all_packages = _packages_cache + _robotic_cache
     scored = []
 
     for pkg in all_packages:
-        name = str(pkg.get("PACKAGE NAME", pkg.get("Package Name", ""))).lower()
-        code = str(pkg.get("PACKAGE CODE", "")).lower()
-        spec = str(pkg.get("SPECIALITY", pkg.get("Speciality", ""))).lower()
+        name = _normalize_search_text(
+            str(pkg.get("PACKAGE NAME", pkg.get("Package Name", ""))))
+        code = _normalize_search_text(str(pkg.get("PACKAGE CODE", "")))
+        spec = _normalize_search_text(
+            str(pkg.get("SPECIALITY", pkg.get("Speciality", ""))))
+        name_tokens = _tokens(name)
+        code_tokens = _tokens(code)
+        spec_tokens = _tokens(spec)
 
         score = 0
+        term_hits_name = 0
+        term_hits_code = 0
+        term_hits_spec = 0
+
         # Score original terms higher
-        for term in terms:
-            if term in code:
+        for term in filtered_terms:
+            if _has_term(term, code, code_tokens):
                 score += 15
-            if term in name:
+                term_hits_code += 1
+            if _has_term(term, name, name_tokens):
                 score += 10
-            if term in spec:
+                term_hits_name += 1
+            if _has_term(term, spec, spec_tokens):
                 score += 5
+                term_hits_spec += 1
+
+        # Generic direct-match priority: most exact textual matches should always rank first.
+        if normalized_query:
+            if normalized_query in code:
+                score += 90
+            if normalized_query in name:
+                score += 75
+            if normalized_query in spec:
+                score += 30
+
+        total_terms = len(filtered_terms)
+        if total_terms > 0:
+            if term_hits_name == total_terms:
+                score += 40
+            elif term_hits_name > 0:
+                score += term_hits_name * 8
+
+            if term_hits_code == total_terms:
+                score += 45
+            elif term_hits_code > 0:
+                score += term_hits_code * 10
+
+            # For one-word searches, elevate exact name matches more aggressively.
+            if total_terms == 1 and _has_term(filtered_terms[0], name, name_tokens):
+                score += 25
+
+            # Reduce expansion-only matches so direct textual matches stay above them.
+            if (term_hits_name + term_hits_code + term_hits_spec) == 0:
+                score -= 12
 
         # Score expanded terms
         for term in expanded_terms:
-            if term not in terms:  # Don't double count
-                if term in code:
+            if term not in filtered_terms:  # Don't double count
+                if _has_term(term, code, code_tokens):
                     score += 8
-                if term in name:
+                if _has_term(term, name, name_tokens):
                     score += 5
-                if term in spec:
+                if _has_term(term, spec, spec_tokens):
                     score += 3
+
+        # Strong phrase-level boosts for high-precision terms.
+        for trigger, keywords in PHRASE_PRIORITY.items():
+            if trigger in query_lower:
+                if any(_has_keyword(k, name, name_tokens) for k in keywords):
+                    score += 40
+
+        # Mild penalty for clearly off-specialty matches on high-precision triggers.
+        for trigger, spec_hints in CONDITION_SPECIALTY_HINTS.items():
+            if trigger in query_lower and not any(_has_keyword(h, spec, spec_tokens) for h in spec_hints):
+                score -= 8
+
+        # Keep angioplasty refinement as secondary to generic direct-match ordering.
+        if "angioplasty" in query_lower and "peripheral" not in query_lower:
+            if _has_keyword("ptca", name, name_tokens) or _has_keyword("coronary", name, name_tokens):
+                score += 16
+            if _has_keyword("peripheral", name, name_tokens) or _has_keyword("peripheral", spec, spec_tokens):
+                score -= 10
 
         if score > 0:
             scored.append((score, pkg))
@@ -1426,6 +1611,379 @@ Return ONLY packages that will likely be APPROVED for this specific case."""
                 "ai_selected": False
             } for p in all_relevant_packages]
         )
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# INTERACTIVE MULTI-STEP SMART SEARCH ENDPOINTS
+# ════════════════════════════════════════════════════════════════════════════════
+
+@app.post("/interactive-search/start", response_model=InteractiveSearchStartResponse)
+async def start_interactive_search(request: InteractiveSearchStartRequest):
+    """
+    Start an interactive multi-step package search flow.
+
+    Returns:
+    - session_id: Use this for subsequent steps
+    - current_step: First step (usually procedure/approach selection)
+    """
+    from tools.smart_search_flow import (
+        build_search_flow,
+        _split_query_terms,
+        advance_past_empty_optional_steps,
+    )
+    from tools.medical_knowledge import get_specialties_for_term
+
+    # Parse query terms
+    query_terms = _split_query_terms(request.query)
+    if request.procedure:
+        query_terms.insert(0, request.procedure)
+    if request.disease and request.disease not in query_terms:
+        query_terms.append(request.disease)
+
+    if not query_terms:
+        raise HTTPException(
+            400, "Please provide a query, procedure, or disease")
+
+    main_term = query_terms[0]
+    addon_terms = query_terms[1:]
+
+    # Search for matching packages
+    matching_packages = _search_packages_basic(main_term, limit=200)
+    if request.disease:
+        disease_packages = _search_packages_basic(request.disease, limit=120)
+        # Merge without duplicates
+        seen = {p.get("PACKAGE CODE", "") for p in matching_packages}
+        for pkg in disease_packages:
+            if pkg.get("PACKAGE CODE", "") not in seen:
+                matching_packages.append(pkg)
+
+    # Specialty fallback to avoid false 404 for terms like appendix/transplant where keyword recall is sparse.
+    if not matching_packages:
+        _load_packages_cache()
+        all_pkgs = _packages_cache + _robotic_cache
+        mapped_specs = get_specialties_for_term(main_term)
+        if mapped_specs:
+            spec_matches = []
+            seen_codes = set()
+            for pkg in all_pkgs:
+                spec = str(
+                    pkg.get("SPECIALITY", pkg.get("Speciality", ""))).lower()
+                code = pkg.get("PACKAGE CODE", "")
+                if not code or code in seen_codes:
+                    continue
+                if any(ms.lower() in spec for ms in mapped_specs):
+                    spec_matches.append(pkg)
+                    seen_codes.add(code)
+            matching_packages = spec_matches[:250]
+
+    if not matching_packages:
+        raise HTTPException(404, f"No packages found for: {main_term}")
+
+    # Build the flow. Use full package cache for add-on discovery.
+    _load_packages_cache()
+    all_packages = _packages_cache + _robotic_cache
+    flow = build_search_flow(
+        main_term,
+        addon_terms,
+        matching_packages,
+        all_packages_for_addons=all_packages,
+    )
+    advance_past_empty_optional_steps(flow)
+
+    # Store flow session
+    session_id = str(uuid.uuid4())
+    _interactive_flows[session_id] = {
+        "flow": flow,
+        "packages": matching_packages,
+        "all_packages": all_packages,
+        "created_at": time.time(),
+        "request": {
+            "query": request.query,
+            "procedure": request.procedure,
+            "disease": request.disease,
+            "symptoms": request.symptoms,
+            "patient_age": request.patient_age,
+            "patient_gender": request.patient_gender,
+        }
+    }
+
+    # Get first step
+    first_step = flow.steps[0] if flow.steps else None
+    if not first_step:
+        raise HTTPException(500, "Failed to build search flow")
+
+    first_step_response = SearchStepResponse(
+        step_number=first_step.step_number,
+        step_name=first_step.step_name,
+        description=first_step.description,
+        options=[
+            SearchOption(
+                id=opt.get("id", ""),
+                label=opt.get("label", ""),
+                description=opt.get("description", ""),
+                specialty=opt.get("specialty"),
+                code=opt.get("code"),
+                rate=opt.get("rate"),
+                reasoning=opt.get("reasoning"),
+            )
+            for opt in first_step.options
+        ],
+        requires_user_selection=first_step.requires_user_selection,
+        context=first_step.context,
+    )
+
+    return InteractiveSearchStartResponse(
+        session_id=session_id,
+        query=request.query,
+        parsed_terms=query_terms,
+        current_step=first_step_response,
+        message=f"Starting interactive search for: {main_term}. Found {len(matching_packages)} related packages.",
+    )
+
+
+@app.get("/interactive-search/{session_id}/step")
+async def get_current_step(session_id: str):
+    """Get the current step for an ongoing flow."""
+    if session_id not in _interactive_flows:
+        raise HTTPException(404, "Session not found")
+
+    session_data = _interactive_flows[session_id]
+    flow = session_data["flow"]
+    from tools.smart_search_flow import advance_past_empty_optional_steps
+    advance_past_empty_optional_steps(flow)
+
+    if flow.flow_complete:
+        return {
+            "status": "complete",
+            "final_recommendation": flow.final_recommendation,
+            "selections": flow.selections,
+        }
+
+    current_step = flow.steps[flow.current_step] if flow.current_step < len(
+        flow.steps) else None
+    if not current_step:
+        raise HTTPException(500, "Invalid flow state")
+
+    return {
+        "step_number": current_step.step_number,
+        "step_name": current_step.step_name,
+        "description": current_step.description,
+        "options": [
+            {
+                "id": opt.get("id", ""),
+                "label": opt.get("label", ""),
+                "description": opt.get("description", ""),
+                "specialty": opt.get("specialty"),
+                "code": opt.get("code"),
+                "rate": opt.get("rate"),
+            }
+            for opt in current_step.options
+        ],
+        "requires_user_selection": current_step.requires_user_selection,
+        "context": current_step.context,
+    }
+
+
+@app.post("/interactive-search/{session_id}/select")
+async def submit_step_selection(session_id: str, selection: SelectionRequest):
+    """
+    Submit user's selection for the current step and move to next step.
+
+    Returns:
+    - success: Whether selection was valid
+    - next_step: The next step to present (or None if flow complete)
+    - flow_complete: Whether the flow finished
+    - final_recommendation: Final packages if flow is complete
+    """
+    if session_id not in _interactive_flows:
+        raise HTTPException(404, "Session not found")
+
+    session_data = _interactive_flows[session_id]
+    flow = session_data["flow"]
+    packages = session_data.get("all_packages") or session_data["packages"]
+
+    # Process the selection
+    from tools.smart_search_flow import process_step_selection
+
+    success, error = process_step_selection(
+        flow,
+        {"id": selection.option_id},
+        packages,
+    )
+
+    if not success:
+        return SelectionResponse(
+            success=False,
+            message=f"Error: {error}",
+            next_step=None,
+            flow_complete=False,
+        )
+
+    # If flow is complete, build final recommendation
+    if flow.flow_complete:
+        # Compile final recommendation from selections
+        final_recommendation = await _build_final_recommendation(flow, packages)
+        flow.final_recommendation = final_recommendation
+
+        return SelectionResponse(
+            success=True,
+            message="Search flow completed! Here are your recommendations.",
+            next_step=None,
+            flow_complete=True,
+            final_recommendation=final_recommendation,
+        )
+
+    # Get next step
+    next_step = flow.steps[flow.current_step] if flow.current_step < len(
+        flow.steps) else None
+    if not next_step:
+        return SelectionResponse(
+            success=True,
+            message="Flow completed.",
+            next_step=None,
+            flow_complete=True,
+        )
+
+    next_step_response = SearchStepResponse(
+        step_number=next_step.step_number,
+        step_name=next_step.step_name,
+        description=next_step.description,
+        options=[
+            SearchOption(
+                id=opt.get("id", ""),
+                label=opt.get("label", ""),
+                description=opt.get("description", ""),
+                specialty=opt.get("specialty"),
+                code=opt.get("code"),
+                rate=opt.get("rate"),
+            )
+            for opt in next_step.options
+        ],
+        requires_user_selection=next_step.requires_user_selection,
+        context=next_step.context,
+    )
+
+    return SelectionResponse(
+        success=True,
+        message="Selection received. Moving to next step.",
+        next_step=next_step_response,
+        flow_complete=False,
+    )
+
+
+@app.get("/interactive-search/{session_id}/status")
+async def get_flow_status(session_id: str):
+    """Get the current status of a flow session."""
+    if session_id not in _interactive_flows:
+        raise HTTPException(404, "Session not found")
+
+    session_data = _interactive_flows[session_id]
+    flow = session_data["flow"]
+
+    return FlowStatusResponse(
+        session_id=session_id,
+        query=flow.query,
+        current_step_number=flow.current_step,
+        total_steps=len(flow.steps),
+        selections_made=flow.selections,
+        violations=flow.violations,
+        flow_complete=flow.flow_complete,
+    )
+
+
+async def _build_final_recommendation(flow: Any, packages: List[Dict]) -> Dict:
+    """Build final package recommendation from flow selections."""
+    from tools.smart_search_flow import validate_package_combination
+
+    result = {
+        "main_package": None,
+        "implant_package": None,
+        "addon_packages": [],
+        "blocked_rules": [],
+        "approval_likelihood": "MEDIUM",
+        "doctor_reasoning": "Packages selected through interactive flow.",
+    }
+
+    package_by_code = {pkg.get("PACKAGE CODE", ""): pkg for pkg in packages}
+    main_sel = None
+    implant_sel = None
+    addon_sels = []
+
+    # Classify selections by selected option id prefix for robust extraction.
+    for selection in flow.selections.values():
+        if not isinstance(selection, dict):
+            continue
+        sel_id = str(selection.get("id", ""))
+        if sel_id.startswith("package_") and not main_sel:
+            main_sel = selection
+        elif sel_id.startswith("implant_"):
+            implant_sel = selection
+        elif sel_id.startswith("addon_"):
+            addon_sels.append(selection)
+
+    if main_sel and main_sel.get("code"):
+        pkg = package_by_code.get(main_sel["code"])
+        if pkg:
+            result["main_package"] = {
+                "code": pkg.get("PACKAGE CODE", ""),
+                "name": pkg.get("PACKAGE NAME", "")[:100],
+                "rate": pkg.get("RATE", 0),
+                "specialty": pkg.get("SPECIALITY", ""),
+                "package_category": pkg.get("PACKAGE CATEGORY", ""),
+                "pre_auth_document": pkg.get("PRE AUTH DOCUMENT", ""),
+                "claim_document": pkg.get("CLAIM DOCUMENT", ""),
+            }
+
+    if implant_sel and implant_sel.get("code") and implant_sel["code"] != "NO_IMPLANT":
+        pkg = package_by_code.get(implant_sel["code"])
+        if pkg:
+            result["implant_package"] = {
+                "code": pkg.get("PACKAGE CODE", ""),
+                "name": pkg.get("PACKAGE NAME", "")[:80],
+                "rate": pkg.get("RATE", 0),
+                "specialty": pkg.get("SPECIALITY", ""),
+                "package_category": pkg.get("PACKAGE CATEGORY", ""),
+                "pre_auth_document": pkg.get("PRE AUTH DOCUMENT", ""),
+                "claim_document": pkg.get("CLAIM DOCUMENT", ""),
+            }
+
+    for selection in addon_sels:
+        code = selection.get("code")
+        if not code:
+            continue
+        pkg = package_by_code.get(code)
+        if not pkg:
+            continue
+        result["addon_packages"].append({
+            "code": pkg.get("PACKAGE CODE", ""),
+            "name": pkg.get("PACKAGE NAME", "")[:80],
+            "rate": pkg.get("RATE", 0),
+            "reason": selection.get("reason", ""),
+            "specialty": pkg.get("SPECIALITY", ""),
+            "package_category": pkg.get("PACKAGE CATEGORY", ""),
+            "pre_auth_document": pkg.get("PRE AUTH DOCUMENT", ""),
+            "claim_document": pkg.get("CLAIM DOCUMENT", ""),
+        })
+
+    # Validate combinations
+    if result["main_package"]:
+        main_pkg = package_by_code.get(result["main_package"]["code"])
+        if not main_pkg:
+            return result
+
+        addon_pkgs = []
+        for addon in result["addon_packages"]:
+            pkg = package_by_code.get(addon["code"])
+            if pkg:
+                addon_pkgs.append(pkg)
+
+        is_valid, violations = validate_package_combination(
+            main_pkg, None, addon_pkgs)
+        result["blocked_rules"] = violations
+        if not is_valid:
+            result["approval_likelihood"] = "LOW"
+
+    return result
 
 
 # ── Dev entry point ────────────────────────────────────────────────────
