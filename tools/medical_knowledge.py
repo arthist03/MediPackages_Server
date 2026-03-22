@@ -630,6 +630,8 @@ def get_packages_for_symptom(symptom: str) -> List[Dict]:
 
     return []
 
+
+def get_specialties_for_term(term: str) -> List[str]:
     """Get relevant specialties for a medical term."""
     term_lower = term.lower()
     specialties = set()

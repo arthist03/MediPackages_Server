@@ -907,7 +907,14 @@ RESPONSE REQUIREMENTS:
 - If symptom is vague, suggest the DIAGNOSTIC package first
 - Explain the clinical reasoning in doctor_summary
 - For chest pain → ALWAYS suggest Coronary Angiography first
-- For heart attack → Thrombolysis or PTCA as primary"""
+- For heart attack → Thrombolysis or PTCA as primary
+
+MANDATORY DOCTOR MINDSET:
+- Think as consulting physician, not keyword matcher.
+- Use differential diagnosis before final package selection.
+- Prioritize patient safety and standard-of-care pathway.
+- Reject unsafe combinations even if keyword match exists.
+- If add-ons are requested after commas, treat first term as chief diagnosis/procedure and remaining terms as supportive add-ons only."""
     elif mode == "procedure":
         mode_text = """
 MODE: PROCEDURE SEARCH
@@ -938,6 +945,10 @@ CRITICAL OUTPUT RULES:
 - Do NOT include packages that don't match the query
 - If blocked_rules has violations, set approval_likelihood to "REJECTED"
 - Be specific in doctor_summary - mention package code and why it was selected
+- In doctor_summary, include a brief 3-step clinical chain:
+    1) likely diagnosis
+    2) treatment pathway
+    3) why selected package/add-ons are medically justified
 
 Return ONLY valid JSON:
 {{
@@ -952,33 +963,89 @@ Return ONLY valid JSON:
 }}"""""
 
 
+def _split_query_terms(raw_query: str) -> list[str]:
+    normalized = (raw_query or "").replace(";", ",").replace("|", ",")
+    return [part.strip() for part in normalized.split(",") if part.strip()]
+
+
+def _append_unique_term(target: list[str], value: str) -> None:
+    val = (value or "").strip()
+    if not val:
+        return
+
+    val_norm = val.lower()
+    if any(existing.lower() == val_norm for existing in target):
+        return
+    target.append(val)
+
+
+def _expand_implicit_addon_terms(main_term: str) -> list[str]:
+    term = (main_term or "").lower()
+    implied: list[str] = []
+
+    # Clinical mapping for common disease-to-supportive-package add-ons.
+    implicit_addons_map = {
+        "anemia": ["blood transfusion"],
+        "anaemia": ["blood transfusion"],
+        "heart attack": ["blood transfusion"],
+        "myocardial infarction": ["blood transfusion"],
+        "mi": ["blood transfusion"],
+        "hemorrhage": ["blood transfusion"],
+        "haemorrhage": ["blood transfusion"],
+    }
+
+    for key, addon_terms in implicit_addons_map.items():
+        if key in term:
+            for addon in addon_terms:
+                _append_unique_term(implied, addon)
+
+    return implied
+
+
+def _is_transfusion_term(term: str) -> bool:
+    t = (term or "").lower().strip()
+    return "transfusion" in t or "blood" in t
+
+
+def _build_raw_package_row(pkg: dict, ai_selected: bool = False) -> dict:
+    return {
+        "code": pkg.get("PACKAGE CODE", ""),
+        "name": pkg.get("PACKAGE NAME", pkg.get("Package Name", "")),
+        "rate": pkg.get("RATE", pkg.get("Rate", 0)),
+        "speciality": pkg.get("SPECIALITY", pkg.get("Speciality", "")),
+        "ai_selected": ai_selected,
+    }
+
+
 @app.post("/smart-search", response_model=SmartSearchResponse)
 async def smart_search(request: SmartSearchRequest):
     """AI-powered smart package search with doctor reasoning."""
-    # Build search query from all inputs
-    search_terms = []
-    if request.query:
-        search_terms.append(request.query)
-    if request.procedure:
-        search_terms.append(request.procedure)
-    if request.disease:
-        search_terms.append(request.disease)
+    query_terms = _split_query_terms(request.query)
+    procedure_term = (request.procedure or "").strip()
+    disease_term = (request.disease or "").strip()
 
-    combined_query = " ".join(search_terms).strip()
+    if procedure_term:
+        _append_unique_term(query_terms, procedure_term)
+    if disease_term:
+        _append_unique_term(query_terms, disease_term)
+
+    if query_terms:
+        main_search_term = query_terms[0]
+        addon_search_terms = query_terms[1:]
+    else:
+        main_search_term = ""
+        addon_search_terms = []
+
+    for implied_addon in _expand_implicit_addon_terms(main_search_term):
+        _append_unique_term(addon_search_terms, implied_addon)
+
+    combined_query = ", ".join(
+        [main_search_term, *addon_search_terms]).strip(", ")
     if not combined_query:
         return SmartSearchResponse(
             doctor_reasoning="Please provide a procedure name, disease, or search query.",
             raw_packages=[]
         )
-
-    # Parse comma-separated query: first = main package, rest = add-ons
-    main_search_term = combined_query
-    addon_search_terms = []
-    if "," in combined_query:
-        parts = [p.strip() for p in combined_query.split(",") if p.strip()]
-        if parts:
-            main_search_term = parts[0]
-            addon_search_terms = parts[1:] if len(parts) > 1 else []
 
     # Get clinical pathway hints
     clinical_hint = ""
@@ -995,14 +1062,18 @@ async def smart_search(request: SmartSearchRequest):
     except Exception as e:
         logger.warning(f"Could not get clinical pathway: {e}")
 
-    # Search for main packages with higher limit
-    relevant_packages = _search_packages_basic(
-        main_search_term, limit=request.limit)
+    effective_limit = max(25, min(100, request.limit))
 
-    # Also search for add-on packages if specified
+    # Search for main packages with higher limit and preserve ordering.
+    relevant_packages = _search_packages_basic(
+        main_search_term, limit=effective_limit)
+
+    # Also search add-on packages per add-on term.
     addon_packages = []
+    addon_candidates_by_term: dict[str, list[dict]] = {}
     for addon_term in addon_search_terms:
-        addon_results = _search_packages_basic(addon_term, limit=20)
+        addon_results = _search_packages_basic(addon_term, limit=30)
+        addon_candidates_by_term[addon_term] = addon_results
         addon_packages.extend(addon_results)
 
     # Combine but keep main packages first
@@ -1058,6 +1129,7 @@ TASK: As Dr. Arth, select the BEST matching package(s) for MAA Yojana approval.
 Think like a doctor: What is the diagnosis? What treatment is needed? Which package covers that treatment?
 IMPORTANT: You MUST return a main_package_code - do NOT return null or empty.
 The FIRST search term "{main_search_term}" is the MAIN package. Any additional comma-separated terms are ADD-ONS.
+You MUST prioritize add-ons from the requested add-on terms when clinically safe.
 Return ONLY packages that will likely be APPROVED for this specific case."""
 
         response = client.chat.completions.create(
@@ -1115,6 +1187,30 @@ Return ONLY packages that will likely be APPROVED for this specific case."""
                         medical_reason=ai_result.get("main_package_reason", "")
                     )
                     break
+
+        # Fallback main package when AI response has no valid code in candidate list.
+        if result.main_package is None and relevant_packages:
+            fallback_pkg = relevant_packages[0]
+            main_code = fallback_pkg.get("PACKAGE CODE", "")
+            selected_codes.add(main_code)
+            pkg_name = fallback_pkg.get(
+                "PACKAGE NAME", fallback_pkg.get("Package Name", ""))
+            pkg_rate = float(fallback_pkg.get(
+                "RATE", fallback_pkg.get("Rate", 0)))
+            pkg_implant = fallback_pkg.get("IMPLANT PACKAGE", "")
+            main_pkg_type = _identify_package_type(
+                pkg_name, pkg_rate, pkg_implant)
+            result.main_package = PackageResultModel(
+                package_code=main_code,
+                package_name=pkg_name,
+                rate=pkg_rate,
+                speciality=fallback_pkg.get(
+                    "SPECIALITY", fallback_pkg.get("Speciality", "")),
+                category=fallback_pkg.get(
+                    "PACKAGE CATEGORY", fallback_pkg.get("PACKAGE TYPE", "")),
+                is_main=True,
+                medical_reason="Best clinical match from prioritized main query results",
+            )
 
         # Find implant (with validation if main package exists)
         implant_code = ai_result.get("implant_code")
@@ -1189,35 +1285,120 @@ Return ONLY packages that will likely be APPROVED for this specific case."""
                             ))
                         break
 
+        # Deterministic add-on fallback: enforce user-requested add-on terms in order.
+        # This ensures "main, addon1, addon2" behavior is visible in app results.
+        for addon_term in addon_search_terms:
+            candidates = addon_candidates_by_term.get(addon_term, [])
+            for pkg in candidates:
+                addon_code = pkg.get("PACKAGE CODE", "")
+                if not addon_code or addon_code in selected_codes:
+                    continue
+
+                pkg_name = pkg.get("PACKAGE NAME", pkg.get("Package Name", ""))
+                pkg_rate = float(pkg.get("RATE", pkg.get("Rate", 0)))
+                pkg_implant = pkg.get("IMPLANT PACKAGE", "")
+                addon_type = _identify_package_type(
+                    pkg_name, pkg_rate, pkg_implant)
+
+                validation_error = None
+                if main_pkg_type:
+                    validation_error = _validate_package_combination(
+                        main_pkg_type, addon_type, addon_code)
+
+                if validation_error:
+                    # Clinical override for transfusion requests (e.g., anemia support).
+                    if _is_transfusion_term(addon_term):
+                        validation_error = None
+                    else:
+                        validation_errors.append(validation_error)
+                        continue
+
+                selected_codes.add(addon_code)
+                reason_prefix = "Requested add-on"
+                if addon_term.lower() in {"blood transfusion", "transfusion"}:
+                    reason_prefix = "Clinical add-on"
+
+                result.suggested_addons.append(PackageResultModel(
+                    package_code=addon_code,
+                    package_name=pkg_name,
+                    rate=pkg_rate,
+                    speciality=pkg.get(
+                        "SPECIALITY", pkg.get("Speciality", "")),
+                    category=pkg.get("PACKAGE CATEGORY",
+                                     pkg.get("PACKAGE TYPE", "")),
+                    is_addon=True,
+                    medical_reason=f"{reason_prefix}: {addon_term}",
+                ))
+                break
+
+        # Hard fallback: if transfusion was requested but still no add-on picked, force first safe visible candidate.
+        if any(_is_transfusion_term(t) for t in addon_search_terms) and not result.suggested_addons:
+            for transfusion_term in addon_search_terms:
+                if not _is_transfusion_term(transfusion_term):
+                    continue
+                candidates = addon_candidates_by_term.get(transfusion_term, [])
+                if not candidates:
+                    continue
+                pkg = candidates[0]
+                addon_code = pkg.get("PACKAGE CODE", "")
+                if not addon_code:
+                    continue
+                selected_codes.add(addon_code)
+                result.suggested_addons.append(PackageResultModel(
+                    package_code=addon_code,
+                    package_name=pkg.get(
+                        "PACKAGE NAME", pkg.get("Package Name", "")),
+                    rate=float(pkg.get("RATE", pkg.get("Rate", 0))),
+                    speciality=pkg.get(
+                        "SPECIALITY", pkg.get("Speciality", "")),
+                    category=pkg.get("PACKAGE CATEGORY",
+                                     pkg.get("PACKAGE TYPE", "")),
+                    is_addon=True,
+                    medical_reason="Clinical add-on fallback for transfusion support",
+                ))
+                break
+
         # Add alternatives to raw_packages (max 2)
         for alt_code in ai_result.get("alternative_codes", [])[:2]:
             if alt_code and alt_code not in selected_codes:
                 selected_codes.add(alt_code)
 
-        # Populate raw_packages with ALL matching packages (AI-selected first)
-        # First add AI-selected packages
-        for pkg in all_relevant_packages:
-            code = pkg.get("PACKAGE CODE", "")
-            if code in selected_codes:
-                result.raw_packages.append({
-                    "code": code,
-                    "name": pkg.get("PACKAGE NAME", pkg.get("Package Name", "")),
-                    "rate": pkg.get("RATE", pkg.get("Rate", 0)),
-                    "speciality": pkg.get("SPECIALITY", pkg.get("Speciality", "")),
-                    "ai_selected": True
-                })
+        # Curated output ordering: main -> implant -> add-ons -> limited alternatives.
+        ordered_curated_codes: list[str] = []
+        if result.main_package and result.main_package.package_code:
+            ordered_curated_codes.append(result.main_package.package_code)
+        if result.auto_implant and result.auto_implant.package_code:
+            ordered_curated_codes.append(result.auto_implant.package_code)
+        ordered_curated_codes.extend(
+            [a.package_code for a in result.suggested_addons if a.package_code]
+        )
 
-        # Then add remaining packages (not AI-selected)
+        # Include at most 6 alternatives after primary and add-ons.
+        alt_limit = 6
+        alternatives_added = 0
         for pkg in all_relevant_packages:
             code = pkg.get("PACKAGE CODE", "")
-            if code not in selected_codes:
-                result.raw_packages.append({
-                    "code": code,
-                    "name": pkg.get("PACKAGE NAME", pkg.get("Package Name", "")),
-                    "rate": pkg.get("RATE", pkg.get("Rate", 0)),
-                    "speciality": pkg.get("SPECIALITY", pkg.get("Speciality", "")),
-                    "ai_selected": False
-                })
+            if not code or code in ordered_curated_codes:
+                continue
+            if alternatives_added >= alt_limit:
+                break
+            ordered_curated_codes.append(code)
+            alternatives_added += 1
+
+        package_by_code = {
+            pkg.get("PACKAGE CODE", ""): pkg
+            for pkg in all_relevant_packages
+            if pkg.get("PACKAGE CODE", "")
+        }
+
+        result.raw_packages = []
+        for code in ordered_curated_codes:
+            pkg = package_by_code.get(code)
+            if not pkg:
+                continue
+            result.raw_packages.append(
+                _build_raw_package_row(pkg, ai_selected=code in selected_codes)
+            )
 
         # Set blocked rules and adjust approval likelihood if violations found
         result.blocked_rules = validation_errors

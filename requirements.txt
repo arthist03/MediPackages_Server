@@ -27,3 +27,9 @@ pydantic>=2.7.0
 
 # ── Groq API (Free fallback) ─────────────────────────────────────────
 groq>=0.5.0
+
+# ── HTTP stack compatibility (avoid RequestsDependencyWarning) ───────
+requests>=2.32.3
+urllib3<3,>=2.2.0
+charset-normalizer<4,>=3.3.0
+chardet<6,>=5.2.0
