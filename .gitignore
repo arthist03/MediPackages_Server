@@ -1,3 +1,11 @@
 .env
 __pycache__/
 *.pyc
+.cache/
+venv/
+.venv/
+.config/
+.upm/
+*.db-journal
+output/
+startup_log.txt

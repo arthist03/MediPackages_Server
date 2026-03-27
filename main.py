@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import base64
+import difflib
 import gc
 import json
 import logging
@@ -68,7 +69,22 @@ _pending_sessions: dict[str, dict] = {}  # session_id → session data
 SESSION_TTL_SECONDS = 3600  # sessions older than 1h are pruned
 
 # ── Interactive search flow sessions ────────────────────────────────────
-_interactive_flows: dict[str, any] = {}  # session_id → FlowState
+_interactive_flows: dict[str, Any] = {}  # session_id → FlowState
+
+
+def _normalize_interactive_step_title(step_name: str) -> str:
+    """Force legacy supportive heading variants to the new Add-ons label."""
+    normalized = (step_name or "").strip().lower()
+    if "supportive" in normalized and "suggest" in normalized:
+        return "Add Ons (If Applicable):"
+    if normalized in {
+        "supportive suggestion for:",
+        "supportive suggestions for:",
+        "supportive suggestion",
+        "supportive suggestions",
+    }:
+        return "Add Ons (If Applicable):"
+    return step_name
 
 
 def _prune_stale_sessions() -> None:
@@ -311,11 +327,11 @@ def _auto_advance_single_option_steps(flow: Any, packages: List[Dict]) -> None:
     """Auto-select steps that have only one non-manual option to reduce unnecessary taps."""
     from tools.smart_search_flow import process_step_selection
 
-    safety_counter = 0
+    safety_counter: int = 0
     while not flow.flow_complete and flow.current_step < len(flow.steps):
         if safety_counter > 20:
             break
-        safety_counter += 1
+        safety_counter = safety_counter + 1
 
         step = flow.steps[flow.current_step]
         options = step.options or []
@@ -746,6 +762,7 @@ async def stats(api_key: str = Depends(get_api_key)):
 # ── Smart Package Search ──────────────────────────────────────────────
 _packages_cache: list[dict] = []
 _robotic_cache: list[dict] = []
+_spelling_vocab_cache: set[str] = set()
 
 
 def _load_packages_cache():
@@ -767,7 +784,7 @@ def _load_packages_cache():
         for candidate in candidates:
             try:
                 if candidate.exists():
-                    with open(candidate, "r", encoding="utf-8") as f:
+                    with open(candidate, "r", encoding="utf-8-sig") as f:
                         data = json.load(f)
                     logger.info("Loaded %s entries from %s",
                                 len(data), candidate)
@@ -806,7 +823,79 @@ def _normalize_search_text(value: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _search_packages_basic(query: str, limit: int = 50) -> list[dict]:
+def _build_spelling_vocab() -> set[str]:
+    """Build a cached medical vocabulary from package metadata for typo correction."""
+    global _spelling_vocab_cache
+    if _spelling_vocab_cache:
+        return _spelling_vocab_cache
+
+    _load_packages_cache()
+    vocab: set[str] = set()
+    for pkg in (_packages_cache + _robotic_cache):
+        blob = " ".join([
+            str(pkg.get("PACKAGE NAME", pkg.get("Package Name", ""))),
+            str(pkg.get("SPECIALITY", pkg.get("Speciality", ""))),
+            str(pkg.get("PACKAGE CATEGORY", pkg.get("PACKAGE TYPE", ""))),
+            str(pkg.get("Procedure Sub Category", "")),
+        ]).lower()
+        for tok in re.findall(r"[a-z]{4,}", blob):
+            vocab.add(tok)
+
+    _spelling_vocab_cache = vocab
+    return _spelling_vocab_cache
+
+
+def _correct_query_terms_spelling(raw_terms: list[str]) -> tuple[list[str], dict[str, str]]:
+    """Conservative spell correction. Only correct when confidence is high."""
+    vocab = _build_spelling_vocab()
+    if not vocab:
+        return raw_terms, {}
+
+    corrections: dict[str, str] = {}
+    corrected_terms: list[str] = []
+
+    for term in raw_terms:
+        original = (term or "").strip()
+        if not original:
+            continue
+
+        tokens = re.findall(r"[a-z0-9]+", original.lower())
+        if not tokens:
+            corrected_terms.append(original)
+            continue
+
+        corrected_tokens: list[str] = []
+        changed = False
+
+        for token in tokens:
+            if len(token) < 4 or token.isdigit() or token in vocab:
+                corrected_tokens.append(token)
+                continue
+
+            candidates = difflib.get_close_matches(
+                token, list(vocab), n=3, cutoff=0.84)
+            replacement = token
+            for cand in candidates:
+                # Guardrails: same first letter + small length delta to avoid wrong suggestions.
+                if cand and cand[0] == token[0] and abs(len(cand) - len(token)) <= 2:
+                    replacement = cand
+                    break
+
+            corrected_tokens.append(replacement)
+            if replacement != token:
+                changed = True
+
+        corrected_term = " ".join(corrected_tokens).strip()
+        if changed and corrected_term:
+            corrections[original] = corrected_term
+            corrected_terms.append(corrected_term)
+        else:
+            corrected_terms.append(original)
+
+    return corrected_terms, corrections
+
+
+def _search_packages_basic(query: str, limit: int = 50) -> List[Dict[str, Any]]:
     """Basic keyword search to pre-filter packages with medical synonym expansion."""
     _load_packages_cache()
     query_lower = _normalize_search_text(query)
@@ -921,7 +1010,7 @@ def _search_packages_basic(query: str, limit: int = 50) -> list[dict]:
     }
 
     all_packages = _packages_cache + _robotic_cache
-    scored = []
+    scored: list[Any] = []
 
     for pkg in all_packages:
         name = _normalize_search_text(
@@ -933,72 +1022,92 @@ def _search_packages_basic(query: str, limit: int = 50) -> list[dict]:
         code_tokens = _tokens(code)
         spec_tokens = _tokens(spec)
 
-        score = 0
-        term_hits_name = 0
-        term_hits_code = 0
-        term_hits_spec = 0
+        score: int = 0
+        term_hits_name: int = 0
+        term_hits_code: int = 0
+        term_hits_spec: int = 0
 
         # Score original terms higher
         for term in filtered_terms:
             if _has_term(term, code, code_tokens):
-                score += 15
-                term_hits_code += 1
+                score = score + 15
+                term_hits_code = term_hits_code + 1
             if _has_term(term, name, name_tokens):
-                score += 10
-                term_hits_name += 1
+                score = score + 10
+                term_hits_name = term_hits_name + 1
             if _has_term(term, spec, spec_tokens):
-                score += 5
-                term_hits_spec += 1
+                score = score + 5
+                term_hits_spec = term_hits_spec + 1
 
         # Generic direct-match priority: most exact textual matches should always rank first.
         if normalized_query:
             if normalized_query in code:
-                score += 90
+                score = score + 90
             if normalized_query in name:
-                score += 75
+                score = score + 75
             if normalized_query in spec:
-                score += 30
+                score = score + 30
+
+        exact_priority = 0
+        if normalized_query:
+            if normalized_query == code:
+                exact_priority = 5
+            elif normalized_query == name:
+                exact_priority = 4
+            elif f" {normalized_query} " in f" {name} ":
+                exact_priority = 3
+            elif f" {normalized_query} " in f" {spec} ":
+                exact_priority = 2
+
+        if len(filtered_terms) == 1:
+            token = filtered_terms[0]
+            if any(tok == token for tok in name_tokens):
+                exact_priority = max(exact_priority, 4)
+            elif any(tok == token for tok in code_tokens):
+                exact_priority = max(exact_priority, 4)
+            elif any(tok == token for tok in spec_tokens):
+                exact_priority = max(exact_priority, 3)
 
         total_terms = len(filtered_terms)
         if total_terms > 0:
             if term_hits_name == total_terms:
-                score += 40
+                score = score + 40
             elif term_hits_name > 0:
-                score += term_hits_name * 8
+                score = score + (term_hits_name * 8)
 
             if term_hits_code == total_terms:
-                score += 45
+                score = score + 45
             elif term_hits_code > 0:
-                score += term_hits_code * 10
+                score = score + (term_hits_code * 10)
 
             # For one-word searches, elevate exact name matches more aggressively.
             if total_terms == 1 and _has_term(filtered_terms[0], name, name_tokens):
-                score += 25
+                score = score + 25
 
             # Reduce expansion-only matches so direct textual matches stay above them.
             if (term_hits_name + term_hits_code + term_hits_spec) == 0:
-                score -= 12
+                score = score - 12
 
         # Score expanded terms
         for term in expanded_terms:
             if term not in filtered_terms:  # Don't double count
                 if _has_term(term, code, code_tokens):
-                    score += 8
+                    score = score + 8
                 if _has_term(term, name, name_tokens):
-                    score += 5
+                    score = score + 5
                 if _has_term(term, spec, spec_tokens):
-                    score += 3
+                    score = score + 3
 
         # Strong phrase-level boosts for high-precision terms.
         for trigger, keywords in PHRASE_PRIORITY.items():
             if trigger in query_lower:
                 if any(_has_keyword(k, name, name_tokens) for k in keywords):
-                    score += 40
+                    score = score + 40
 
         # Mild penalty for clearly off-specialty matches on high-precision triggers.
         for trigger, spec_hints in CONDITION_SPECIALTY_HINTS.items():
             if trigger in query_lower and not any(_has_keyword(h, spec, spec_tokens) for h in spec_hints):
-                score -= 8
+                score = score - 8
 
         # Generic symptom-intent anchoring: for symptom-like queries, prefer packages matching inferred specialties.
         spec_norm = _normalize_words(spec)
@@ -1011,24 +1120,24 @@ def _search_packages_basic(query: str, limit: int = 50) -> list[dict]:
             for rel in active_related_terms
         )
         if spec_matches_intent:
-            score += 10
+            score = score + 10
         elif strict_intent_query:
-            score -= 18
+            score = score - 18
             if not related_match:
                 continue
 
         # Keep angioplasty refinement as secondary to generic direct-match ordering.
         if "angioplasty" in query_lower and "peripheral" not in query_lower:
             if _has_keyword("ptca", name, name_tokens) or _has_keyword("coronary", name, name_tokens):
-                score += 16
+                score = score + 16
             if _has_keyword("peripheral", name, name_tokens) or _has_keyword("peripheral", spec, spec_tokens):
-                score -= 10
+                score = score - 10
 
         if score > 0:
-            scored.append((score, pkg))
+            scored.append((exact_priority, score, pkg))
 
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [p for _, p in scored[:limit]]
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return [p for _, _, p in scored[:limit]]
 
 
 def _format_packages_for_ai(packages: list[dict]) -> str:
@@ -1301,6 +1410,138 @@ def _build_raw_package_row(pkg: dict, ai_selected: bool = False) -> dict:
     }
 
 
+def _prioritize_exact_main_term_first(packages: list[dict], main_term: str) -> list[dict]:
+    """Keep exact main-term matches at the top while preserving existing order for ties."""
+    normalized_term = _normalize_search_text(main_term or "")
+    if not normalized_term:
+        return packages
+
+    term_tokens = re.findall(r"[a-z0-9]+", normalized_term)
+    if not term_tokens:
+        return packages
+
+    padded_exact_phrase = f" {normalized_term} "
+
+    def _rank(pkg: dict) -> int:
+        full_name = str(pkg.get("PACKAGE NAME", ""))
+        primary_name = _normalize_search_text(full_name.split("|")[0] if "|" in full_name else full_name)
+        full_name_norm = _normalize_search_text(full_name)
+        
+        primary_padded = f" {primary_name} "
+        full_padded = f" {full_name_norm} "
+
+        name_tokens = re.findall(r"[a-z0-9]+", full_name_norm)
+        primary_tokens = re.findall(r"[a-z0-9]+", primary_name)
+
+        # Rank 0: Exact phrase in the PRIMARY name (e.g. searching "blood" gets a package named "Blood...")
+        if padded_exact_phrase in primary_padded:
+            return 0
+        if len(term_tokens) == 1 and any(tok == term_tokens[0] for tok in primary_tokens):
+            return 1
+        
+        # Rank 2: Exact phrase anywhere in the full description (e.g. "Severe Anemia | blood transfusion")
+        if padded_exact_phrase in full_padded:
+            return 2
+        
+        if all(tok in name_tokens for tok in term_tokens):
+            return 3
+        if any(tok in name_tokens for tok in term_tokens):
+            return 4
+        if normalized_term in full_name_norm:
+            return 5
+        return 6
+
+    return sorted(packages, key=_rank)
+
+def _classify_input_intent(terms: list[str]) -> dict[str, str]:
+    """
+    Use Groq AI to classify a list of input terms as 'Surgical', 'Medical', or 'Unknown'.
+    """
+    from groq import Groq
+    if not GROQ_API_KEY or not terms:
+        return {t: "Unknown" for t in terms}
+
+    prompt = f"""You are a medical categorization assistant for the MAA Yojana health insurance scheme.
+Classify each of the following medical terms/inputs as either "Surgical" (requires an operation or procedure) or "Medical" (medical management, conservative treatment, general disease with no procedure).
+
+IMPORTANT MAA YOJANA RULE: "Blood", "Blood Transfusion", "ICU", "Extended LOS", implants, and supportive care MUST always be classified as "Medical".
+
+Inputs to classify:
+{", ".join(terms)}
+
+Respond ONLY with a valid JSON object where keys are the exact input terms and values are either "Surgical" or "Medical". Do not include any other text or explanation.
+
+Example:
+{{"lap chole": "Surgical", "sepsis": "Medical", "fever": "Medical", "appendectomy": "Surgical"}}
+"""
+    try:
+        client = Groq(api_key=GROQ_API_KEY)
+        response = client.chat.completions.create(
+            model="llama3-8b-8192",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            response_format={"type": "json_object"}
+        )
+        content = response.choices[0].message.content
+        import json
+        return json.loads(content)
+    except Exception as e:
+        logger.warning(f"AI classification failed: {e}")
+        return {t: "Unknown" for t in terms}
+
+def _check_intent_rule_violation(intents: dict[str, str]) -> str | None:
+    """Check if the intents violate Rule 1 (mix of Surgical and Medical)."""
+    if not intents:
+        return None
+    has_surgical = any(v.lower() == "surgical" for v in intents.values())
+    has_medical = any(v.lower() == "medical" for v in intents.values())
+    
+    if has_surgical and has_medical:
+        surgical_terms = [k for k, v in intents.items() if v.lower() == "surgical"]
+        medical_terms = [k for k, v in intents.items() if v.lower() == "medical"]
+        return f"Rule 1 VIOLATION: Cannot combine surgical procedures ({', '.join(surgical_terms)}) with medical management conditions ({', '.join(medical_terms)})."
+    return None
+
+def _get_ai_related_terms(terms: list[str]) -> list[str]:
+    """
+    Use Groq AI to suggest 3-5 related medical conditions or treatments for the input terms.
+    E.g. if terms = ['blood transfusion'], it might suggest ['anemia', 'hemorrhage'].
+    """
+    from groq import Groq
+    if not GROQ_API_KEY or not terms:
+        return []
+    
+    prompt = f"""You are a senior reporting doctor.
+Given the patient's search inputs: {", ".join(terms)}
+
+What are 3 to 5 related medical conditions or supportive treatments you would suggest exploring packages for?
+Return a simple JSON array of strings. Do not include the original terms.
+
+Example for 'blood transfusion': ["anemia", "hemorrhage", "thalassemia"]
+"""
+    try:
+        client = Groq(api_key=GROQ_API_KEY)
+        response = client.chat.completions.create(
+            model="llama3-8b-8192",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            response_format={"type": "json_object"}  # Workaround: instruct might be better as array, but using json_object needs an object.
+        )
+        content = response.choices[0].message.content
+        import json
+        data = json.loads(content)
+        # Handle if the LLM wraps it in a dict like {"suggestions": [...]}
+        if isinstance(data, dict):
+            for v in data.values():
+                if isinstance(v, list):
+                    return [str(item) for item in v]
+        elif isinstance(data, list):
+            return [str(item) for item in data]
+        return []
+    except Exception as e:
+        logger.warning(f"AI related terms suggestion failed: {e}")
+        return []
+
 @app.post("/smart-search", response_model=SmartSearchResponse)
 async def smart_search(request: SmartSearchRequest):
     """AI-powered smart package search with doctor reasoning."""
@@ -1313,7 +1554,23 @@ async def smart_search(request: SmartSearchRequest):
     if disease_term:
         _append_unique_term(query_terms, disease_term)
 
+    query_terms, spelling_corrections = _correct_query_terms_spelling(
+        query_terms)
+
     if query_terms:
+        # ----- AI Intent Classification Check -----
+        if len(query_terms) > 1:
+            input_intents = _classify_input_intent(query_terms)
+            violation = _check_intent_rule_violation(input_intents)
+            if violation:
+                return SmartSearchResponse(
+                    doctor_reasoning=f"⚠️ {violation}\n\nPlease revise your search. Under MAA Yojana rules, surgical procedures and medical management packages with ₹0 rate cannot be booked together.",
+                    raw_packages=[],
+                    blocked_rules=[violation],
+                    approval_likelihood="REJECTED"
+                )
+        # ------------------------------------------
+
         main_search_term = query_terms[0]
         addon_search_terms = query_terms[1:]
     else:
@@ -1351,6 +1608,8 @@ async def smart_search(request: SmartSearchRequest):
     # Search for main packages with higher limit and preserve ordering.
     relevant_packages = _search_packages_basic(
         main_search_term, limit=effective_limit)
+    relevant_packages = _prioritize_exact_main_term_first(
+        relevant_packages, main_search_term)
 
     # Also search add-on packages per add-on term.
     addon_packages = []
@@ -1370,8 +1629,12 @@ async def smart_search(request: SmartSearchRequest):
             seen_codes.add(code)
 
     if not relevant_packages:
+        correction_hint = ""
+        if spelling_corrections:
+            correction_hint = " Did you mean: " + \
+                ", ".join(spelling_corrections.values()) + "?"
         return SmartSearchResponse(
-            doctor_reasoning=f"No packages found matching '{main_search_term}'. Please try different keywords or check spelling.",
+            doctor_reasoning=f"No packages found matching '{main_search_term}'. Please try different keywords or check spelling.{correction_hint}",
             raw_packages=[]
         )
 
@@ -1441,8 +1704,8 @@ Return ONLY packages that will likely be APPROVED for this specific case."""
             raw_packages=[]  # Will populate with only selected packages
         )
 
-        main_pkg_data = None
         main_pkg_type = None
+        standalone_main_selected = False
 
         # Find main package
         main_code = ai_result.get("main_package_code")
@@ -1457,7 +1720,8 @@ Return ONLY packages that will likely be APPROVED for this specific case."""
 
                     main_pkg_type = _identify_package_type(
                         pkg_name, pkg_rate, pkg_implant)
-                    main_pkg_data = pkg
+                    standalone_main_selected = bool(
+                        main_pkg_type.get("is_standalone"))
 
                     result.main_package = PackageResultModel(
                         package_code=main_code,
@@ -1484,6 +1748,7 @@ Return ONLY packages that will likely be APPROVED for this specific case."""
             pkg_implant = fallback_pkg.get("IMPLANT PACKAGE", "")
             main_pkg_type = _identify_package_type(
                 pkg_name, pkg_rate, pkg_implant)
+            standalone_main_selected = bool(main_pkg_type.get("is_standalone"))
             result.main_package = PackageResultModel(
                 package_code=main_code,
                 package_name=pkg_name,
@@ -1496,9 +1761,13 @@ Return ONLY packages that will likely be APPROVED for this specific case."""
                 medical_reason="Best clinical match from prioritized main query results",
             )
 
+        # Stand-alone package must remain exclusive in smart-search too.
+        if standalone_main_selected:
+            result.auto_implant = None
+            result.suggested_addons = []
         # Find implant (with validation if main package exists)
         implant_code = ai_result.get("implant_code")
-        if implant_code and implant_code != "null":
+        if not standalone_main_selected and implant_code and implant_code != "null":
             selected_codes.add(implant_code)
             for pkg in _packages_cache + _robotic_cache:
                 if pkg.get("PACKAGE CODE", "") == implant_code:
@@ -1531,7 +1800,7 @@ Return ONLY packages that will likely be APPROVED for this specific case."""
                     break
 
         # Find add-ons (with validation)
-        for addon in ai_result.get("addons", [])[:5]:  # Max 5 addons
+        for addon in ([] if standalone_main_selected else ai_result.get("addons", [])[:5]):  # Max 5 addons
             addon_code = addon.get("code")
             if addon_code and main_pkg_type:
                 for pkg in _packages_cache + _robotic_cache:
@@ -1571,7 +1840,7 @@ Return ONLY packages that will likely be APPROVED for this specific case."""
 
         # Deterministic add-on fallback: enforce user-requested add-on terms in order.
         # This ensures "main, addon1, addon2" behavior is visible in app results.
-        for addon_term in addon_search_terms:
+        for addon_term in ([] if standalone_main_selected else addon_search_terms):
             candidates = addon_candidates_by_term.get(addon_term, [])
             for pkg in candidates:
                 addon_code = pkg.get("PACKAGE CODE", "")
@@ -1616,7 +1885,7 @@ Return ONLY packages that will likely be APPROVED for this specific case."""
                 break
 
         # Hard fallback: if transfusion was requested but still no add-on picked, force first safe visible candidate.
-        if any(_is_transfusion_term(t) for t in addon_search_terms) and not result.suggested_addons:
+        if (not standalone_main_selected) and any(_is_transfusion_term(t) for t in addon_search_terms) and not result.suggested_addons:
             for transfusion_term in addon_search_terms:
                 if not _is_transfusion_term(transfusion_term):
                     continue
@@ -1659,7 +1928,7 @@ Return ONLY packages that will likely be APPROVED for this specific case."""
 
         # Include at most 6 alternatives after primary and add-ons.
         alt_limit = 6
-        alternatives_added = 0
+        alternatives_added: int = 0
         for pkg in all_relevant_packages:
             code = pkg.get("PACKAGE CODE", "")
             if not code or code in ordered_curated_codes:
@@ -1667,7 +1936,7 @@ Return ONLY packages that will likely be APPROVED for this specific case."""
             if alternatives_added >= alt_limit:
                 break
             ordered_curated_codes.append(code)
-            alternatives_added += 1
+            alternatives_added = alternatives_added + 1
 
         package_by_code = {
             pkg.get("PACKAGE CODE", ""): pkg
@@ -1690,8 +1959,14 @@ Return ONLY packages that will likely be APPROVED for this specific case."""
             if result.approval_likelihood not in ["REJECTED", "LOW"]:
                 result.approval_likelihood = "LOW"
             # Append validation summary to doctor reasoning
-            result.doctor_reasoning += f"\n\n⚠️ RULE VIOLATIONS DETECTED:\n" + \
+            result.doctor_reasoning += "\n\n⚠️ RULE VIOLATIONS DETECTED:\n" + \
                 "\n".join(f"• {err}" for err in validation_errors[:5])
+
+        if spelling_corrections:
+            correction_text = ", ".join(
+                f"{src} -> {dst}" for src, dst in spelling_corrections.items()
+            )
+            result.doctor_reasoning = f"Spelling suggestion applied: {correction_text}\n\n{result.doctor_reasoning}"
 
         logger.info(
             f"Smart search completed: '{main_search_term}' -> {len(selected_codes)} packages selected, {len(validation_errors)} violations")
@@ -1739,24 +2014,35 @@ async def start_interactive_search(request: InteractiveSearchStartRequest):
     if request.disease and request.disease not in query_terms:
         query_terms.append(request.disease)
 
+    query_terms, spelling_corrections = _correct_query_terms_spelling(
+        query_terms)
+
     if not query_terms:
         raise HTTPException(
             400, "Please provide a query, procedure, or disease")
 
+    # ----- AI Intent Classification Check -----
+    if len(query_terms) > 1:
+        input_intents = _classify_input_intent(query_terms)
+        violation = _check_intent_rule_violation(input_intents)
+        if violation:
+            raise HTTPException(400, violation)
+    # ------------------------------------------
+
     main_term = query_terms[0]
     addon_terms = query_terms[1:]
 
-    # Search for matching packages
+    # Search for matching packages for the MAIN term
     matching_packages = _search_packages_basic(main_term, limit=200)
+    matching_packages = _prioritize_exact_main_term_first(matching_packages, main_term)
     if request.disease:
         disease_packages = _search_packages_basic(request.disease, limit=120)
-        # Merge without duplicates
         seen = {p.get("PACKAGE CODE", "") for p in matching_packages}
         for pkg in disease_packages:
             if pkg.get("PACKAGE CODE", "") not in seen:
                 matching_packages.append(pkg)
 
-    # Specialty fallback to avoid false 404 for terms like appendix/transplant where keyword recall is sparse.
+    # Specialty fallback for main term
     if not matching_packages:
         _load_packages_cache()
         all_pkgs = _packages_cache + _robotic_cache
@@ -1767,7 +2053,7 @@ async def start_interactive_search(request: InteractiveSearchStartRequest):
             )
         mapped_specs = get_specialties_for_term(main_term)
         if mapped_specs:
-            spec_matches = []
+            spec_matches: list[Any] = []
             seen_codes = set()
             for pkg in all_pkgs:
                 spec = str(
@@ -1783,14 +2069,35 @@ async def start_interactive_search(request: InteractiveSearchStartRequest):
     if not matching_packages:
         raise HTTPException(404, f"No packages found for: {main_term}")
 
-    # Build the flow. Use full package cache for add-on discovery.
+    # Search for matching packages per addon term
     _load_packages_cache()
     all_packages = _packages_cache + _robotic_cache
+
+    per_term_packages: dict[str, list] = {main_term: matching_packages}
+    for term in addon_terms:
+        term_pkgs = _search_packages_basic(term, limit=200)
+        term_pkgs = _prioritize_exact_main_term_first(term_pkgs, term)
+        if not term_pkgs:
+            # Fallback: search from all packages by keyword
+            term_lower = term.lower().strip()
+            import re as _re
+            term_tokens = [t for t in _re.findall(r"[a-z0-9]+", term_lower) if len(t) > 2]
+            if term_tokens:
+                for pkg in all_packages:
+                    name = str(pkg.get("PACKAGE NAME", "")).lower()
+                    spec = str(pkg.get("SPECIALITY", "")).lower()
+                    if any(tok in f"{name} {spec}" for tok in term_tokens):
+                        term_pkgs.append(pkg)
+                term_pkgs = term_pkgs[:200]
+        per_term_packages[term] = term_pkgs
+
+    # Build the flow with per-term package lists
     flow = build_search_flow(
         main_term,
         addon_terms,
         matching_packages,
         all_packages_for_addons=all_packages,
+        per_term_packages=per_term_packages,
     )
     advance_past_empty_optional_steps(flow)
     _auto_advance_single_option_steps(flow, all_packages)
@@ -1820,7 +2127,7 @@ async def start_interactive_search(request: InteractiveSearchStartRequest):
 
     first_step_response = SearchStepResponse(
         step_number=first_step.step_number,
-        step_name=first_step.step_name,
+        step_name=_normalize_interactive_step_title(first_step.step_name),
         description=first_step.description,
         options=[
             SearchOption(
@@ -1844,7 +2151,10 @@ async def start_interactive_search(request: InteractiveSearchStartRequest):
         query=request.query,
         parsed_terms=query_terms,
         current_step=first_step_response,
-        message=f"Starting interactive search for: {main_term}. Found {len(matching_packages)} related packages.",
+        message=(
+            (f"Did you mean: {', '.join(spelling_corrections.values())}? " if spelling_corrections else "") +
+            f"Starting interactive search for: {main_term}. Found {len(matching_packages)} related packages."
+        ),
     )
 
 
@@ -1876,7 +2186,7 @@ async def get_current_step(session_id: str):
 
     return {
         "step_number": current_step.step_number,
-        "step_name": current_step.step_name,
+        "step_name": _normalize_interactive_step_title(current_step.step_name),
         "description": current_step.description,
         "options": [
             {
@@ -1965,7 +2275,7 @@ async def submit_step_selection(session_id: str, selection: SelectionRequest):
 
     next_step_response = SearchStepResponse(
         step_number=next_step.step_number,
-        step_name=next_step.step_name,
+        step_name=_normalize_interactive_step_title(next_step.step_name),
         description=next_step.description,
         options=[
             SearchOption(
@@ -2013,86 +2323,146 @@ async def get_flow_status(session_id: str):
 
 
 async def _build_final_recommendation(flow: Any, packages: List[Dict]) -> Dict:
-    """Build final package recommendation from flow selections."""
+    """Build final package recommendation from flow selections.
+
+    Produces both:
+    - Flat lists (selected_packages, implant_packages, etc.) for backward compat
+    - term_groups: ordered list of per-term objects for grouped rendering
+    """
     from tools.smart_search_flow import validate_package_combination
 
-    result = {
+    result: Dict[str, Any] = {
         "main_package": None,
+        "selected_packages": [],
         "implant_package": None,
+        "implant_packages": [],
+        "stratification_package": None,
+        "stratification_packages": [],
         "addon_packages": [],
+        "term_groups": [],           # NEW: per-term grouped packages
         "blocked_rules": [],
         "approval_likelihood": "MEDIUM",
         "doctor_reasoning": "Packages selected through interactive flow.",
     }
 
     package_by_code = {pkg.get("PACKAGE CODE", ""): pkg for pkg in packages}
-    main_sel = None
-    implant_sel = None
-    addon_sels = []
 
-    # Classify selections by selected option id prefix for robust extraction.
-    for selection in flow.selections.values():
-        if not isinstance(selection, dict):
-            continue
-        sel_id = str(selection.get("id", ""))
-        if sel_id.startswith("package_") and not main_sel:
-            main_sel = selection
-        elif sel_id.startswith("implant_"):
-            implant_sel = selection
-        elif sel_id.startswith("addon_"):
-            addon_sels.append(selection)
-
-    if main_sel and main_sel.get("code"):
-        pkg = package_by_code.get(main_sel["code"])
-        if pkg:
-            result["main_package"] = {
-                "code": pkg.get("PACKAGE CODE", ""),
-                "name": pkg.get("PACKAGE NAME", "")[:100],
-                "rate": pkg.get("RATE", 0),
-                "specialty": pkg.get("SPECIALITY", ""),
-                "package_category": pkg.get("PACKAGE CATEGORY", ""),
-                "pre_auth_document": pkg.get("PRE AUTH DOCUMENT", ""),
-                "claim_document": pkg.get("CLAIM DOCUMENT", ""),
-            }
-
-    if implant_sel and implant_sel.get("code") and implant_sel["code"] != "NO_IMPLANT":
-        pkg = package_by_code.get(implant_sel["code"])
-        if pkg:
-            result["implant_package"] = {
-                "code": pkg.get("PACKAGE CODE", ""),
-                "name": pkg.get("PACKAGE NAME", "")[:80],
-                "rate": pkg.get("RATE", 0),
-                "specialty": pkg.get("SPECIALITY", ""),
-                "package_category": pkg.get("PACKAGE CATEGORY", ""),
-                "pre_auth_document": pkg.get("PRE AUTH DOCUMENT", ""),
-                "claim_document": pkg.get("CLAIM DOCUMENT", ""),
-            }
-
-    for selection in addon_sels:
-        code = selection.get("code")
-        if not code:
-            continue
-        pkg = package_by_code.get(code)
-        if not pkg:
-            continue
-        result["addon_packages"].append({
+    def _make_entry(pkg: Dict, max_name: int = 100) -> Dict:
+        return {
             "code": pkg.get("PACKAGE CODE", ""),
-            "name": pkg.get("PACKAGE NAME", "")[:80],
+            "name": pkg.get("PACKAGE NAME", "")[:max_name],
             "rate": pkg.get("RATE", 0),
-            "reason": selection.get("reason", ""),
             "specialty": pkg.get("SPECIALITY", ""),
             "package_category": pkg.get("PACKAGE CATEGORY", ""),
             "pre_auth_document": pkg.get("PRE AUTH DOCUMENT", ""),
             "claim_document": pkg.get("CLAIM DOCUMENT", ""),
-        })
+        }
+
+    def _safe_rate(entry: Dict) -> float:
+        raw = entry.get("rate", 0)
+        if isinstance(raw, (int, float)):
+            return float(raw)
+        try:
+            return float(str(raw).replace(",", "").strip())
+        except Exception:
+            return 0.0
+
+    # ── Walk steps in order to build term_groups ─────────────────────────
+    # Each step stores context.intent_term; we group by that.
+    # term_groups_map: term -> {main_package, implants, strats, subtotal}
+    from collections import OrderedDict
+    term_groups_map: OrderedDict = OrderedDict()
+
+    current_term = ""
+    for step_idx, step in enumerate(flow.steps):
+        sel_key = f"step_{step_idx}"
+        selection = flow.selections.get(sel_key)
+        if not isinstance(selection, dict):
+            continue
+
+        sel_id = str(selection.get("id", ""))
+        sel_code = str(selection.get("code", "")).strip()
+
+        # Determine which term this step belongs to
+        step_term = (step.context.get("intent_term", "") or "").strip()
+        if step_term:
+            current_term = step_term
+
+        # Skip non-package selections (skip, manual without code, clarification)
+        if not sel_code or "skip" in sel_id.lower():
+            continue
+
+        pkg = package_by_code.get(sel_code)
+        if not pkg:
+            continue
+
+        entry = _make_entry(pkg)
+
+        # Ensure term group exists
+        term_key = current_term or "main"
+        if term_key not in term_groups_map:
+            term_groups_map[term_key] = {
+                "term": term_key,
+                "main_package": None,
+                "implant_packages": [],
+                "stratification_packages": [],
+                "subtotal": 0.0,
+            }
+        group = term_groups_map[term_key]
+
+        if sel_id.startswith("package_"):
+            group["main_package"] = entry
+            group["subtotal"] += _safe_rate(entry)
+            # Flat compat
+            result["selected_packages"].append(entry)
+            if result["main_package"] is None:
+                result["main_package"] = entry
+
+        elif sel_id.startswith("implant_"):
+            if sel_code != "NO_IMPLANT":
+                group["implant_packages"].append(entry)
+                group["subtotal"] += _safe_rate(entry)
+                # Flat compat
+                result["implant_packages"].append(entry)
+                if result["implant_package"] is None:
+                    result["implant_package"] = entry
+
+        elif sel_id.startswith("strat_"):
+            group["stratification_packages"].append(entry)
+            group["subtotal"] += _safe_rate(entry)
+            # Flat compat
+            result["stratification_packages"].append(entry)
+            if result["stratification_package"] is None:
+                result["stratification_package"] = entry
+
+        elif sel_id.startswith("addon_"):
+            # Add-ons go to flat list only (not per-term)
+            addon_entry = {**entry, "reason": selection.get("reason", "")}
+            result["addon_packages"].append(addon_entry)
+
+    # Convert term_groups_map to ordered list
+    result["term_groups"] = list(term_groups_map.values())
 
     # Validate combinations
-    if result["main_package"]:
-        main_pkg = package_by_code.get(result["main_package"]["code"])
+    main_package_result = result.get("main_package")
+    if isinstance(main_package_result, dict):
+        main_pkg = package_by_code.get(main_package_result.get("code", ""))
         if not main_pkg:
             return result
 
         addon_pkgs = []
+        # Include other selected packages as combination targets
+        for sp in result["selected_packages"][1:]:
+            p = package_by_code.get(sp.get("code", ""))
+            if p:
+                addon_pkgs.append(p)
+
+        stratification_result = result.get("stratification_package")
+        if isinstance(stratification_result, dict):
+            strat_pkg = package_by_code.get(
+                stratification_result.get("code", ""))
+            if strat_pkg:
+                addon_pkgs.append(strat_pkg)
         for addon in result["addon_packages"]:
             pkg = package_by_code.get(addon["code"])
             if pkg:

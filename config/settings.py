@@ -60,8 +60,10 @@ TOP_K_PACKAGES = int(os.getenv("TOP_K_PACKAGES", "5"))
 
 # ── Server ────────────────────────────────────────────────────────────
 SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")
-SERVER_PORT = int(os.getenv("SERVER_PORT", "8000"))
+# Replit sets PORT automatically; fall back to SERVER_PORT then 8000
+SERVER_PORT = int(os.getenv("PORT", os.getenv("SERVER_PORT", "8000")))
 SERVER_WORKERS = int(os.getenv("SERVER_WORKERS", "1"))
+RATE_LIMIT_RPM = int(os.getenv("RATE_LIMIT_RPM", "60"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "20"))
 CORS_ORIGINS = _parse_csv(os.getenv("CORS_ORIGINS"), ["*"])
@@ -76,10 +78,18 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 MEMORY_DB.parent.mkdir(parents=True, exist_ok=True)
 
 # ── Security validation ────────────────────────────────────────────────
-# API_AUTH_TOKEN MUST be set in .env — no hardcoded fallback allowed
+# API_AUTH_TOKEN MUST be set in .env or Replit Secrets
 API_AUTH_TOKEN = os.getenv("API_AUTH_TOKEN", "")
 if not API_AUTH_TOKEN:
-    raise RuntimeError(
-        "API_AUTH_TOKEN is not set. "
-        "Add it to server/.env before starting the server."
+    import warnings
+    warnings.warn(
+        "⚠️ API_AUTH_TOKEN is not set! "
+        "Set it in .env or Replit Secrets before going live.",
+        RuntimeWarning,
+        stacklevel=2,
     )
+    # Generate a temporary token so the server can start for setup
+    import secrets as _sec
+    API_AUTH_TOKEN = _sec.token_hex(32)
+    print(f"🔑 Temporary API_AUTH_TOKEN generated: {API_AUTH_TOKEN}")
+    print("   Set this in Replit Secrets → API_AUTH_TOKEN for persistence.")
