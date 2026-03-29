@@ -1155,19 +1155,28 @@ def _format_packages_for_ai(packages: list[dict]) -> str:
     return "\n".join(result)
 
 
-def _identify_package_type(name: str, rate: float, implant_field: str) -> dict[str, bool]:
-    """Identify package type based on package name, rate, and implant field."""
-    name_upper = name.upper()
-    implant_upper = implant_field.upper()
-    is_implant = 'IMPLANT' in implant_upper and 'NO IMPLANT' not in implant_upper
+def _identify_package_type(pkg: dict) -> dict[str, bool]:
+    """Identify package type based on package data."""
+    name = pkg.get("PACKAGE NAME", pkg.get("Package Name", "")).upper()
+    rate_val = pkg.get("RATE", pkg.get("Rate", 0))
+    try:
+        rate = float(str(rate_val).replace(",", "").strip()) if rate_val else 0.0
+    except Exception:
+        rate = 0.0
+    implant_field = str(pkg.get("IMPLANT PACKAGE", pkg.get("IMPLANT", "NO IMPLANT")) or "NO IMPLANT").upper()
+    cat = str(pkg.get("PACKAGE CATEGORY", pkg.get("PACKAGE TYPE", pkg.get("Procedure Type", ""))) or "").upper()
+
+    is_implant = 'IMPLANT' in implant_field and 'NO IMPLANT' not in implant_field
+    is_standalone = 'STAND-ALONE' in name or 'STAND ALONE' in name or 'STAND ALONE' in cat or 'STAND-ALONE' in cat
+    is_addon = '[ADD-ON' in name or '[ADD ON' in name or 'ADDON' in name or 'ADD-ON' in cat or 'ADD ON' in cat or 'ADDON' in cat
 
     return {
-        'is_surgical': rate > 0 and '[REGULAR PROCEDURE]' in name_upper,
-        'is_medical_management': rate == 0 and '[ADD' not in name_upper,
-        'is_standalone': 'STAND-ALONE' in name_upper or 'STAND ALONE' in name_upper,
-        'is_addon': '[ADD-ON' in name_upper or '[ADD ON' in name_upper or 'ADDON' in name_upper,
-        'is_implant': is_implant,
-        'is_extended_los': 'EXTENDED LOS' in name_upper,
+        'is_surgical': rate > 0 and ('[REGULAR PROCEDURE]' in name or 'REGULAR PKG' in cat),
+        'is_medical_management': rate == 0 and not is_addon,
+        'is_standalone': is_standalone,
+        'is_addon': is_addon,
+        'is_implant': is_implant or cat == 'IMP',
+        'is_extended_los': 'EXTENDED LOS' in name,
     }
 
 
@@ -1423,7 +1432,7 @@ def _prioritize_exact_main_term_first(packages: list[dict], main_term: str) -> l
     padded_exact_phrase = f" {normalized_term} "
 
     def _rank(pkg: dict) -> int:
-        full_name = str(pkg.get("PACKAGE NAME", ""))
+        full_name = str(pkg.get("PACKAGE NAME", pkg.get("Package Name", "")))
         primary_name = _normalize_search_text(full_name.split("|")[0] if "|" in full_name else full_name)
         full_name_norm = _normalize_search_text(full_name)
         
@@ -1453,41 +1462,75 @@ def _prioritize_exact_main_term_first(packages: list[dict], main_term: str) -> l
 
     return sorted(packages, key=_rank)
 
-def _classify_input_intent(terms: list[str]) -> dict[str, str]:
+def _classify_input_intent(term_specialties_map: dict[str, list[str]]) -> dict[str, str]:
     """
-    Use Groq AI to classify a list of input terms as 'Surgical', 'Medical', or 'Unknown'.
+    Classify terms as 'Surgical', 'Medical', or 'Unknown'.
+    First uses internal deterministic logic, then queries Groq AI.
     """
     from groq import Groq
-    if not GROQ_API_KEY or not terms:
-        return {t: "Unknown" for t in terms}
+    from config.settings import GROQ_MODEL, GROQ_API_KEY
+    from tools.medical_knowledge import is_medical_management_term, is_surgical_term
+    
+    if not GROQ_API_KEY or not term_specialties_map:
+        return {t: "Unknown" for t in term_specialties_map}
+
+    intents = {}
+    terms_for_ai = {}
+
+    for term, specs in term_specialties_map.items():
+        term_lower = term.lower()
+        if is_medical_management_term(term) or term_lower in ["sepsis", "anemia", "fever", "infection", "shock"]:
+            intents[term] = "Medical"
+        elif is_surgical_term(term):
+            intents[term] = "Surgical"
+        else:
+            terms_for_ai[term] = specs
+            
+    if not terms_for_ai:
+        return intents
+
+    input_details = []
+    for term, specs in terms_for_ai.items():
+        spec_str = ", ".join(specs) if specs else "No specific specialty"
+        input_details.append(f"- Term: '{term}' (Matching Package Specialties: {spec_str})")
+        
+    inputs_str = "\n".join(input_details)
 
     prompt = f"""You are a medical categorization assistant for the MAA Yojana health insurance scheme.
 Classify each of the following medical terms/inputs as either "Surgical" (requires an operation or procedure) or "Medical" (medical management, conservative treatment, general disease with no procedure).
 
+Use the provided "Matching Package Specialties" to guide your decision.
+- Surgical Specialties: General Surgery, Orthopaedics, Cardiac Surgery, Neurosurgery, Paediatric Surgery.
+- Medical Specialties: General Medicine, Medical Oncology, Cardiology, Paediatric Medical Management, Nephrology, Neurology, Pulmonology.
+
 IMPORTANT MAA YOJANA RULE: "Blood", "Blood Transfusion", "ICU", "Extended LOS", implants, and supportive care MUST always be classified as "Medical".
 
 Inputs to classify:
-{", ".join(terms)}
+{inputs_str}
 
 Respond ONLY with a valid JSON object where keys are the exact input terms and values are either "Surgical" or "Medical". Do not include any other text or explanation.
 
 Example:
-{{"lap chole": "Surgical", "sepsis": "Medical", "fever": "Medical", "appendectomy": "Surgical"}}
+{{"lap chole": "Surgical", "dengue": "Medical", "fever": "Medical", "appendectomy": "Surgical"}}
 """
     try:
         client = Groq(api_key=GROQ_API_KEY)
         response = client.chat.completions.create(
-            model="llama3-8b-8192",
+            model=GROQ_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
             response_format={"type": "json_object"}
         )
         content = response.choices[0].message.content
         import json
-        return json.loads(content)
+        llm_intents = json.loads(content)
+        intents.update(llm_intents)
+        return intents
     except Exception as e:
         logger.warning(f"AI classification failed: {e}")
-        return {t: "Unknown" for t in terms}
+        for t in terms_for_ai:
+            intents[t] = "Unknown"
+        return intents
 
 def _check_intent_rule_violation(intents: dict[str, str]) -> str | None:
     """Check if the intents violate Rule 1 (mix of Surgical and Medical)."""
@@ -1558,19 +1601,6 @@ async def smart_search(request: SmartSearchRequest):
         query_terms)
 
     if query_terms:
-        # ----- AI Intent Classification Check -----
-        if len(query_terms) > 1:
-            input_intents = _classify_input_intent(query_terms)
-            violation = _check_intent_rule_violation(input_intents)
-            if violation:
-                return SmartSearchResponse(
-                    doctor_reasoning=f"⚠️ {violation}\n\nPlease revise your search. Under MAA Yojana rules, surgical procedures and medical management packages with ₹0 rate cannot be booked together.",
-                    raw_packages=[],
-                    blocked_rules=[violation],
-                    approval_likelihood="REJECTED"
-                )
-        # ------------------------------------------
-
         main_search_term = query_terms[0]
         addon_search_terms = query_terms[1:]
     else:
@@ -1618,6 +1648,36 @@ async def smart_search(request: SmartSearchRequest):
         addon_results = _search_packages_basic(addon_term, limit=30)
         addon_candidates_by_term[addon_term] = addon_results
         addon_packages.extend(addon_results)
+
+    # ----- AI Intent Classification Check (with Package Specialties) -----
+    if len(query_terms) > 1:
+        term_specialties = {}
+        # Main term specs
+        specs = set()
+        for p in relevant_packages[:15]:
+            spec = str(p.get("SPECIALITY", "")).strip()
+            if spec: specs.add(spec)
+        term_specialties[main_search_term] = list(specs)[:3]
+        
+        # Addon terms specs
+        for t in addon_search_terms:
+            pkgs = addon_candidates_by_term.get(t, [])
+            specs = set()
+            for p in pkgs[:15]:
+                spec = str(p.get("SPECIALITY", "")).strip()
+                if spec: specs.add(spec)
+            term_specialties[t] = list(specs)[:3]
+            
+        input_intents = _classify_input_intent(term_specialties)
+        violation = _check_intent_rule_violation(input_intents)
+        if violation:
+            return SmartSearchResponse(
+                doctor_reasoning=f"⚠️ {violation}\n\nPlease revise your search. Under MAA Yojana rules, surgical procedures and medical management packages with ₹0 rate cannot be booked together.",
+                raw_packages=[],
+                blocked_rules=[violation],
+                approval_likelihood="REJECTED"
+            )
+    # ---------------------------------------------------------------------
 
     # Combine but keep main packages first
     all_relevant_packages = relevant_packages.copy()
@@ -1848,10 +1908,8 @@ Return ONLY packages that will likely be APPROVED for this specific case."""
                     continue
 
                 pkg_name = pkg.get("PACKAGE NAME", pkg.get("Package Name", ""))
-                pkg_rate = float(pkg.get("RATE", pkg.get("Rate", 0)))
-                pkg_implant = pkg.get("IMPLANT PACKAGE", "")
-                addon_type = _identify_package_type(
-                    pkg_name, pkg_rate, pkg_implant)
+                pkg_rate = pkg.get("RATE", pkg.get("Rate", 0))
+                addon_type = _identify_package_type(pkg)
 
                 validation_error = None
                 if main_pkg_type:
@@ -2021,13 +2079,7 @@ async def start_interactive_search(request: InteractiveSearchStartRequest):
         raise HTTPException(
             400, "Please provide a query, procedure, or disease")
 
-    # ----- AI Intent Classification Check -----
-    if len(query_terms) > 1:
-        input_intents = _classify_input_intent(query_terms)
-        violation = _check_intent_rule_violation(input_intents)
-        if violation:
-            raise HTTPException(400, violation)
-    # ------------------------------------------
+    # AI intent check moved after package search natively uses specialties
 
     main_term = query_terms[0]
     addon_terms = query_terms[1:]
@@ -2091,6 +2143,27 @@ async def start_interactive_search(request: InteractiveSearchStartRequest):
                 term_pkgs = term_pkgs[:200]
         per_term_packages[term] = term_pkgs
 
+    # ----- AI Intent Classification Check (with Package Specialties) -----
+    start_violation = None
+    if len(query_terms) > 1:
+        term_specialties = {}
+        for t in query_terms:
+            pkgs = per_term_packages.get(t, [])
+            if t == main_term and not pkgs:
+                pkgs = matching_packages
+            specs = set()
+            for p in pkgs[:15]:
+                spec = str(p.get("SPECIALITY", "")).strip()
+                if spec:
+                    specs.add(spec)
+            term_specialties[t] = list(specs)[:3]
+            
+        input_intents = _classify_input_intent(term_specialties)
+        start_violation = _check_intent_rule_violation(input_intents)
+        if start_violation:
+            logger.warning(f"Initial intent violation detected: {start_violation}")
+    # ---------------------------------------------------------------------
+
     # Build the flow with per-term package lists
     flow = build_search_flow(
         main_term,
@@ -2152,6 +2225,7 @@ async def start_interactive_search(request: InteractiveSearchStartRequest):
         parsed_terms=query_terms,
         current_step=first_step_response,
         message=(
+            (f"{start_violation} | " if start_violation else "") +
             (f"Did you mean: {', '.join(spelling_corrections.values())}? " if spelling_corrections else "") +
             f"Starting interactive search for: {main_term}. Found {len(matching_packages)} related packages."
         ),
@@ -2302,6 +2376,64 @@ async def submit_step_selection(session_id: str, selection: SelectionRequest):
     )
 
 
+@app.post("/interactive-search/{session_id}/undo")
+async def undo_step_selection(session_id: str):
+    """
+    Undo the last selection made in the flow.
+    Returns the step to which the flow has reverted.
+    """
+    if session_id not in _interactive_flows:
+        raise HTTPException(404, "Session not found")
+
+    session_data = _interactive_flows[session_id]
+    flow = session_data["flow"]
+
+    from tools.smart_search_flow import undo_last_selection
+    success, message = undo_last_selection(flow)
+
+    if not success:
+        return JSONResponse(
+            status_code=400,
+            content={"success": False, "message": message}
+        )
+
+    # Get the "new" current step after undo
+    current_step = flow.steps[flow.current_step] if flow.current_step < len(flow.steps) else None
+    
+    if not current_step:
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "message": "Reverted, but no current step found."}
+        )
+
+    step_response = SearchStepResponse(
+        step_number=current_step.step_number,
+        step_name=_normalize_interactive_step_title(current_step.step_name),
+        description=current_step.description,
+        options=[
+            SearchOption(
+                id=opt.get("id", ""),
+                label=opt.get("label", ""),
+                description=opt.get("description", ""),
+                specialty=opt.get("specialty"),
+                code=opt.get("code"),
+                rate=opt.get("rate"),
+                reasoning=opt.get("reasoning") or opt.get("reason"),
+                rank=opt.get("rank"),
+            )
+            for opt in current_step.options
+        ],
+        requires_user_selection=current_step.requires_user_selection,
+        context=current_step.context,
+    )
+
+    return {
+        "success": True,
+        "message": message,
+        "current_step": step_response
+    }
+
+
 @app.get("/interactive-search/{session_id}/status")
 async def get_flow_status(session_id: str):
     """Get the current status of a flow session."""
@@ -2348,14 +2480,18 @@ async def _build_final_recommendation(flow: Any, packages: List[Dict]) -> Dict:
     package_by_code = {pkg.get("PACKAGE CODE", ""): pkg for pkg in packages}
 
     def _make_entry(pkg: Dict, max_name: int = 100) -> Dict:
+        name = pkg.get("PACKAGE NAME", pkg.get("Package Name", ""))
+        rate = pkg.get("RATE", pkg.get("Rate", 0))
+        spec = pkg.get("SPECIALITY", pkg.get("Speciality", pkg.get("SPECIALITY NAME", "")))
+        cat = pkg.get("PACKAGE CATEGORY", pkg.get("PACKAGE TYPE", pkg.get("Procedure Type", "")))
         return {
             "code": pkg.get("PACKAGE CODE", ""),
-            "name": pkg.get("PACKAGE NAME", "")[:max_name],
-            "rate": pkg.get("RATE", 0),
-            "specialty": pkg.get("SPECIALITY", ""),
-            "package_category": pkg.get("PACKAGE CATEGORY", ""),
-            "pre_auth_document": pkg.get("PRE AUTH DOCUMENT", ""),
-            "claim_document": pkg.get("CLAIM DOCUMENT", ""),
+            "name": name[:max_name],
+            "rate": rate,
+            "specialty": spec,
+            "package_category": cat,
+            "pre_auth_document": pkg.get("PRE AUTH DOCUMENT", pkg.get("Mandatory Documents", "")),
+            "claim_document": pkg.get("CLAIM DOCUMENT", pkg.get("Mandatory Documents - Claim Processing", "")),
         }
 
     def _safe_rate(entry: Dict) -> float:
@@ -2458,18 +2594,24 @@ async def _build_final_recommendation(flow: Any, packages: List[Dict]) -> Dict:
                 addon_pkgs.append(p)
 
         stratification_result = result.get("stratification_package")
+        strat_pkg = None
         if isinstance(stratification_result, dict):
             strat_pkg = package_by_code.get(
                 stratification_result.get("code", ""))
-            if strat_pkg:
-                addon_pkgs.append(strat_pkg)
+
+        implant_result = result.get("implant_package")
+        implant_pkg = None
+        if isinstance(implant_result, dict):
+            implant_pkg = package_by_code.get(
+                implant_result.get("code", ""))
+
         for addon in result["addon_packages"]:
             pkg = package_by_code.get(addon["code"])
             if pkg:
                 addon_pkgs.append(pkg)
 
         is_valid, violations = validate_package_combination(
-            main_pkg, None, addon_pkgs)
+            main_pkg, implant_pkg, strat_pkg, addon_pkgs)
         result["blocked_rules"] = violations
         if not is_valid:
             result["approval_likelihood"] = "LOW"
