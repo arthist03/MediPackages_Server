@@ -1,5 +1,6 @@
 """
 main.py  —  FastAPI production server for the LangGraph OCR pipeline.
+Now optimized for Vercel Serverless Functions.
 
 Endpoints:
   POST /extract        — Main OCR endpoint (called by Flutter app)
@@ -8,7 +9,8 @@ Endpoints:
   GET  /stats          — Pipeline statistics from long-term memory
 
 Usage:
-  uvicorn main:app --host 0.0.0.0 --port 8000
+  Vercel: auto-deployed via vercel.json
+  Local:  uvicorn main:app --host 0.0.0.0 --port 8000
 """
 from __future__ import annotations
 

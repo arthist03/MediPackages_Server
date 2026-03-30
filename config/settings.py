@@ -8,7 +8,16 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).parents[1] / ".env", override=True)
+# ── Environment Detection ─────────────────────────────────────────────
+IS_VERCEL = "VERCEL" in os.environ or "VERCEL_ENV" in os.environ
+
+if not IS_VERCEL:
+    # On Replit/Local, load from .env file
+    load_dotenv(Path(__file__).parents[1] / ".env", override=True)
+else:
+    # On Vercel, environment variables are managed via the dashboard
+    print("🚀 Running in Vercel Serverless environment")
+
 
 
 def _parse_bool(value: str | None, default: bool = False) -> bool:
@@ -28,9 +37,16 @@ def _parse_csv(value: str | None, default: list[str]) -> list[str]:
 BASE_DIR = Path(__file__).parents[1].resolve()
 PACKAGES_JSON = Path(os.getenv("PACKAGES_JSON", str(
     BASE_DIR.parent / "assets" / "maa_packages.json")))
-OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", str(BASE_DIR / "output")))
-MEMORY_DB = Path(os.getenv("MEMORY_DB", str(
-    BASE_DIR / "memory" / "agent_memory.db")))
+
+if IS_VERCEL:
+    # Vercel filesystem is read-only; use /tmp for all write operations
+    # Note: SQLite data will be lost when the serverless function spins down
+    OUTPUT_DIR = Path("/tmp/output")
+    MEMORY_DB = Path("/tmp/agent_memory.db")
+else:
+    OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", str(BASE_DIR / "output")))
+    MEMORY_DB = Path(os.getenv("MEMORY_DB", str(
+        BASE_DIR / "memory" / "agent_memory.db")))
 
 # ── Gemini API (Primary LLM) ──────────────────────────────────────────
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
@@ -74,8 +90,15 @@ TRUSTED_HOSTS = _parse_csv(
 ENABLE_DOCS = _parse_bool(os.getenv("ENABLE_DOCS"), default=False)
 APP_ENV = os.getenv("APP_ENV", "production").strip().lower()
 # ── Ensure dirs exist ─────────────────────────────────────────────────
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-MEMORY_DB.parent.mkdir(parents=True, exist_ok=True)
+try:
+    if IS_VERCEL:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    else:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        MEMORY_DB.parent.mkdir(parents=True, exist_ok=True)
+except Exception as e:
+    if not IS_VERCEL:
+        print(f"⚠️ Could not create directories: {e}")
 
 # ── Security validation ────────────────────────────────────────────────
 # API_AUTH_TOKEN MUST be set in .env or Replit Secrets
