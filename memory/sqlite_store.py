@@ -53,12 +53,44 @@ class AgentMemory:
                     count       INTEGER DEFAULT 1,
                     last_seen   TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS app_sessions (
+                    id          TEXT PRIMARY KEY,
+                    session_type TEXT,
+                    data        TEXT,
+                    updated_at  TEXT NOT NULL
+                );
             """)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         return conn
+
+    # ── Session persistence ───────────────────────────────────────────
+    def save_session(self, session_id: str, session_type: str, data: dict) -> None:
+        ts = datetime.utcnow().isoformat()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO app_sessions (id, session_type, data, updated_at) VALUES (?,?,?,?)",
+                (session_id, session_type, json.dumps(data, ensure_ascii=False), ts),
+            )
+
+    def get_session(self, session_id: str) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT data FROM app_sessions WHERE id=?", (session_id,)
+            ).fetchone()
+            if row:
+                try:
+                    return json.loads(row["data"])
+                except Exception:
+                    return None
+        return None
+
+    def delete_session(self, session_id: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM app_sessions WHERE id=?", (session_id,))
 
     # ── Request tracking ──────────────────────────────────────────────
     def create_request(self, session_id: str, raw_text: str = "") -> int:

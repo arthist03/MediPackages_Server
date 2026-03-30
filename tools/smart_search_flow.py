@@ -1121,3 +1121,33 @@ def undo_last_selection(flow: FlowState) -> Tuple[bool, str]:
     flow.final_recommendation = None
 
     return True, f"Reverted to Step {flow.current_step + 1}"
+
+
+def reconstruct_flow_from_state(
+    query: str,
+    addon_terms: List[str],
+    selections: List[Dict[str, Any]],
+    matching_packages: List[Dict[str, Any]],
+    all_packages: List[Dict[str, Any]],
+    per_term_packages: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+) -> FlowState:
+    """
+    Reconstruct a FlowState by re-running the build and re-applying selections.
+    This is essential for stateless environments like Vercel.
+    """
+    # 1. Build the initial flow
+    flow = build_search_flow(
+        query,
+        addon_terms,
+        matching_packages,
+        all_packages_for_addons=all_packages,
+        per_term_packages=per_term_packages
+    )
+
+    # 2. Re-apply selections sequentially to reach the same state
+    for sel in selections:
+        if flow.flow_complete:
+            break
+        process_step_selection(flow, sel, all_packages)
+
+    return flow

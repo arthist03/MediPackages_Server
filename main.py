@@ -485,6 +485,14 @@ async def extract_ocr(image: UploadFile = File(...), api_key: str = Depends(get_
                 "vision_text": final_state.get("vision_text", ""),
                 "created_at": time.time(),
             }
+            
+            # Persist to DB for Vercel statelessness
+            try:
+                from memory.sqlite_store import AgentMemory
+                mem = AgentMemory()
+                mem.save_session(session_id, "ocr_pending", _pending_sessions[session_id])
+            except Exception as e:
+                logger.error(f"Failed to persist OCR session to DB: {e}")
 
             # Prune old sessions on each new request to avoid unbounded growth
             _prune_stale_sessions()
@@ -526,7 +534,19 @@ async def submit_feedback(req: FeedbackRequest, api_key: str = Depends(get_api_k
     """
     session_id = req.session_id
     if session_id not in _pending_sessions:
-        raise HTTPException(404, f"No pending session: {session_id}")
+        # Try to recover from DB
+        try:
+            from memory.sqlite_store import AgentMemory
+            mem = AgentMemory()
+            db_session = mem.get_session(session_id)
+            if db_session:
+                _pending_sessions[session_id] = db_session
+            else:
+                raise HTTPException(404, f"No pending session: {session_id}")
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(404, f"No pending session found: {session_id}")
 
     if req.decision not in ("approved", "rejected"):
         raise HTTPException(400, "decision must be 'approved' or 'rejected'")
@@ -589,6 +609,14 @@ async def submit_feedback(req: FeedbackRequest, api_key: str = Depends(get_api_k
         # Resume the pipeline
         result = await _run_pipeline_async(None, config)
         _pending_sessions.pop(session_id, None)
+        
+        # Remove from DB persistence
+        try:
+            from memory.sqlite_store import AgentMemory
+            mem = AgentMemory()
+            mem.delete_session(session_id)
+        except:
+            pass
 
         final = result.get("final_response", {})
         if not final:
@@ -633,7 +661,19 @@ async def retry_extraction(req: FeedbackRequest, api_key: str = Depends(get_api_
     """
     session_id = req.session_id
     if session_id not in _pending_sessions:
-        raise HTTPException(404, f"No pending session: {session_id}")
+        # Try to recover from DB
+        try:
+            from memory.sqlite_store import AgentMemory
+            mem = AgentMemory()
+            db_session = mem.get_session(session_id)
+            if db_session:
+                _pending_sessions[session_id] = db_session
+            else:
+                raise HTTPException(404, f"No pending session was found: {session_id}")
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(404, f"No pending session: {session_id}")
 
     session = _pending_sessions[session_id]
     retry_count = session.get("retry_count", 0) + 1
@@ -695,6 +735,15 @@ async def retry_extraction(req: FeedbackRequest, api_key: str = Depends(get_api_
                 "vision_text": final_state.get("vision_text", ""),
                 "created_at": time.time(),
             }
+            
+            # Persist new session to DB, remove old one
+            try:
+                from memory.sqlite_store import AgentMemory
+                mem = AgentMemory()
+                mem.delete_session(session_id)
+                mem.save_session(new_session_id, "ocr_pending", _pending_sessions[new_session_id])
+            except:
+                pass
 
             resp = {
                 "success": True,
@@ -2051,6 +2100,83 @@ Return ONLY packages that will likely be APPROVED for this specific case."""
 # INTERACTIVE MULTI-STEP SMART SEARCH ENDPOINTS
 # ════════════════════════════════════════════════════════════════════════════════
 
+async def _get_or_reconstruct_flow(session_id: str) -> Tuple[Any, List[Dict], Dict]:
+    """Helper to load flow from memory OR reconstruct from SQLite on Vercel."""
+    from memory.sqlite_store import AgentMemory
+    from tools.smart_search_flow import reconstruct_flow_from_state
+    
+    mem = AgentMemory()
+    
+    # Try in-memory first (fastest)
+    if session_id in _interactive_flows:
+        data = _interactive_flows[session_id]
+        return data["flow"], data["all_packages"], data.get("per_term_packages", {})
+    
+    # Try reconstruction from DB
+    session_data = mem.get_session(session_id)
+    if not session_data:
+        logger.warning(f"Session {session_id} not found in memory or DB")
+        raise HTTPException(404, "Session not found or expired. Please start a new search.")
+    
+    query = session_data.get("query", "")
+    addon_terms = session_data.get("addon_terms", [])
+    selections = session_data.get("selections_list", []) # List of selection dicts
+    
+    # Re-run search (fast due to _packages_cache)
+    _load_packages_cache()
+    all_packages = _packages_cache + _robotic_cache
+    
+    main_term = query
+    matching_packages = _search_packages_basic(main_term, limit=200)
+    matching_packages = _prioritize_exact_main_term_first(matching_packages, main_term)
+    
+    per_term_packages: dict[str, list] = {main_term: matching_packages}
+    for term in addon_terms:
+        term_pkgs = _search_packages_basic(term, limit=200)
+        term_pkgs = _prioritize_exact_main_term_first(term_pkgs, term)
+        per_term_packages[term] = term_pkgs
+        
+    flow = reconstruct_flow_from_state(
+        query=query,
+        addon_terms=addon_terms,
+        selections=selections,
+        matching_packages=matching_packages,
+        all_packages=all_packages,
+        per_term_packages=per_term_packages
+    )
+    
+    # Sync in-memory for future requests on this instance
+    _interactive_flows[session_id] = {
+        "flow": flow,
+        "packages": matching_packages,
+        "all_packages": all_packages,
+        "per_term_packages": per_term_packages,
+        "created_at": time.time(),
+        "selections_list": selections
+    }
+    
+    return flow, all_packages, per_term_packages
+
+
+def _update_session_database(session_id: str, flow: Any, selections_list: List[Dict]):
+    """Sync the in-memory flow state back to the persistent SQLite DB."""
+    try:
+        from memory.sqlite_store import AgentMemory
+        mem = AgentMemory()
+        
+        # We only store query, terms, and the order of selections
+        # We re-run the search on load to keep DB size small
+        session_record = {
+            "query": flow.query,
+            "addon_terms": [t for t in flow.parsed_terms if t != flow.query],
+            "selections_list": selections_list,
+            "flow_complete": flow.flow_complete
+        }
+        mem.save_session(session_id, "interactive_search", session_record)
+    except Exception as e:
+        logger.error(f"Failed to sync session to DB: {e}")
+
+
 @app.post("/interactive-search/start", response_model=InteractiveSearchStartResponse)
 async def start_interactive_search(request: InteractiveSearchStartRequest):
     """
@@ -2183,7 +2309,9 @@ async def start_interactive_search(request: InteractiveSearchStartRequest):
         "flow": flow,
         "packages": matching_packages,
         "all_packages": all_packages,
+        "per_term_packages": per_term_packages,
         "created_at": time.time(),
+        "selections_list": [],
         "request": {
             "query": request.query,
             "procedure": request.procedure,
@@ -2193,6 +2321,9 @@ async def start_interactive_search(request: InteractiveSearchStartRequest):
             "patient_gender": request.patient_gender,
         }
     }
+    
+    # Persist to DB for Vercel statelessness
+    _update_session_database(session_id, flow, [])
 
     # Get first step
     first_step = flow.steps[flow.current_step] if flow.steps and flow.current_step < len(
@@ -2240,10 +2371,8 @@ async def get_current_step(session_id: str):
     if session_id not in _interactive_flows:
         raise HTTPException(404, "Session not found")
 
-    session_data = _interactive_flows[session_id]
-    flow = session_data["flow"]
-    packages = session_data.get(
-        "all_packages") or session_data.get("packages", [])
+    flow, packages, per_term_packages = await _get_or_reconstruct_flow(session_id)
+    
     from tools.smart_search_flow import advance_past_empty_optional_steps
     advance_past_empty_optional_steps(flow)
     _auto_advance_single_option_steps(flow, packages)
@@ -2296,9 +2425,7 @@ async def submit_step_selection(session_id: str, selection: SelectionRequest):
     if session_id not in _interactive_flows:
         raise HTTPException(404, "Session not found")
 
-    session_data = _interactive_flows[session_id]
-    flow = session_data["flow"]
-    packages = session_data.get("all_packages") or session_data["packages"]
+    flow, packages, per_term_packages = await _get_or_reconstruct_flow(session_id)
 
     # Process the selection
     from tools.smart_search_flow import process_step_selection
@@ -2320,6 +2447,16 @@ async def submit_step_selection(session_id: str, selection: SelectionRequest):
             next_step=None,
             flow_complete=False,
         )
+
+    # Success: Update our selection history and Sync to DB
+    selections_list = _interactive_flows[session_id].get("selections_list", [])
+    selections_list.append({
+        "id": selection.option_id,
+        "notes": selection.notes,
+        "manual_package": selection.manual_package,
+    })
+    _interactive_flows[session_id]["selections_list"] = selections_list
+    _update_session_database(session_id, flow, selections_list)
 
     # Auto-progress any subsequent single-option steps.
     _auto_advance_single_option_steps(flow, packages)
@@ -2387,11 +2524,18 @@ async def undo_step_selection(session_id: str):
     if session_id not in _interactive_flows:
         raise HTTPException(404, "Session not found")
 
-    session_data = _interactive_flows[session_id]
-    flow = session_data["flow"]
+    flow, packages, per_term_packages = await _get_or_reconstruct_flow(session_id)
 
     from tools.smart_search_flow import undo_last_selection
     success, message = undo_last_selection(flow)
+
+    if success:
+        # Update history
+        selections_list = _interactive_flows[session_id].get("selections_list", [])
+        if selections_list:
+            selections_list.pop()
+        _interactive_flows[session_id]["selections_list"] = selections_list
+        _update_session_database(session_id, flow, selections_list)
 
     if not success:
         return JSONResponse(
