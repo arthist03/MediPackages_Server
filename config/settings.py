@@ -100,6 +100,9 @@ except Exception as e:
     if not IS_VERCEL:
         print(f"⚠️ Could not create directories: {e}")
 
+# ── Firebase ──────────────────────────────────────────────────────────
+FIREBASE_SERVICE_ACCOUNT = os.getenv("FIREBASE_SERVICE_ACCOUNT", "")
+
 # ── Security validation ────────────────────────────────────────────────
 # API_AUTH_TOKEN MUST be set in .env or Replit Secrets
 API_AUTH_TOKEN = os.getenv("API_AUTH_TOKEN", "")

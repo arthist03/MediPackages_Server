@@ -107,12 +107,18 @@ async def lifespan(app: FastAPI):
     global _pipeline
     gc.collect()
 
+    from config.settings import GROQ_API_KEY, FIREBASE_SERVICE_ACCOUNT
     # Check Groq API key
     if not GROQ_API_KEY:
         logger.error(
             "⚠️ GROQ_API_KEY not set! Get one at https://console.groq.com/keys")
     else:
         logger.info("✅ Groq API key configured")
+
+    if not FIREBASE_SERVICE_ACCOUNT:
+        logger.warning("⚠️ FIREBASE_SERVICE_ACCOUNT not set! Push notifications will be disabled.")
+    else:
+        logger.info("✅ Firebase Service Account configured")
 
     logger.info("🚀 Compiling LangGraph pipeline…")
     try:
@@ -219,6 +225,19 @@ def get_api_key(api_key_value: str = Security(api_key_scheme)):
         status_code=403,
         detail="Could not validate credentials",
     )
+
+
+# ── Push Notification Models ──────────────────────────────────────────
+class PushMessage(BaseModel):
+    token: str
+    title: str
+    body: str
+    icon: Optional[str] = "not_icon"
+    color: Optional[str] = "#0052D4"
+
+
+class PushNotificationRequest(BaseModel):
+    messages: List[PushMessage]
 
 
 # ── Request models ─────────────────────────────────────────────────────
@@ -808,6 +827,82 @@ async def stats(api_key: str = Depends(get_api_key)):
     except Exception as e:
         logger.exception("Stats endpoint failed")
         raise HTTPException(500, "Failed to fetch statistics")
+
+
+@app.post("/send-push")
+async def send_push_notification(req: PushNotificationRequest, api_key: str = Depends(get_api_key)):
+    """
+    Secure proxy for sending FCM HTTP v1 notifications.
+    Uses the server-side Service Account to negotiate tokens.
+    """
+    from config.settings import FIREBASE_SERVICE_ACCOUNT
+    if not FIREBASE_SERVICE_ACCOUNT:
+        raise HTTPException(
+            500, "Push notifications not configured: Missing FIREBASE_SERVICE_ACCOUNT")
+
+    try:
+        sa_info = json.loads(FIREBASE_SERVICE_ACCOUNT)
+        project_id = sa_info.get("project_id")
+
+        # 1. Negotiate Access Token
+        from google.oauth2 import service_account
+        import google.auth.transport.requests as auth_requests
+
+        scopes = ["https://www.googleapis.com/auth/firebase.messaging"]
+        creds = service_account.Credentials.from_service_account_info(
+            sa_info, scopes=scopes)
+
+        request = auth_requests.Request()
+        creds.refresh(request)
+        access_token = creds.token
+
+        # 2. Batch Send
+        import requests
+        results = []
+        for msg in req.messages:
+            fcm_url = f"https://fcm.googleapis.com/v1/projects/{project_id}/messages:send"
+            payload = {
+                "message": {
+                    "token": msg.token,
+                    "notification": {
+                        "title": msg.title,
+                        "body": msg.body,
+                    },
+                    "android": {
+                        "notification": {
+                            "icon": msg.icon,
+                            "color": msg.color
+                        }
+                    },
+                    "apns": {
+                        "payload": {
+                            "aps": {
+                                "sound": "default"
+                            }
+                        }
+                    },
+                    "data": {
+                        "click_action": "FLUTTER_NOTIFICATION_CLICK"
+                    }
+                }
+            }
+            res = requests.post(
+                fcm_url,
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json"
+                },
+                json=payload
+            )
+            results.append(
+                {"token": msg.token, "ok": res.ok, "status": res.status_code})
+
+        success_count = len([r for r in results if r["ok"]])
+        return {"success": True, "sent": success_count, "total": len(req.messages), "details": results}
+
+    except Exception as e:
+        logger.exception("FCM Proxy Error")
+        raise HTTPException(500, f"Failed to send notifications: {str(e)}")
 
 
 # ── Smart Package Search ──────────────────────────────────────────────
