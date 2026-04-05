@@ -303,6 +303,15 @@ class SearchStepResponse(BaseModel):
     context: Optional[dict] = None
 
 
+class AnalyzeQueryRequest(BaseModel):
+    query: str
+
+
+class AnalyzeQueryResponse(BaseModel):
+    summary: str
+    keywords: list[str]
+
+
 class InteractiveSearchStartRequest(BaseModel):
     query: str
     procedure: str = ""
@@ -2270,6 +2279,64 @@ def _update_session_database(session_id: str, flow: Any, selections_list: List[D
         mem.save_session(session_id, "interactive_search", session_record)
     except Exception as e:
         logger.error(f"Failed to sync session to DB: {e}")
+
+
+@app.post("/interactive-search/analyze-query", response_model=AnalyzeQueryResponse)
+async def analyze_interactive_query(request: AnalyzeQueryRequest):
+    """
+    Use Groq AI to summarize a free-text patient history and extract 1-3 highly relevant clinical keywords
+    that match potential medical packages or procedures.
+    """
+    from groq import Groq
+    from config.settings import GROQ_API_KEY
+    import json
+    
+    if not GROQ_API_KEY:
+        raise HTTPException(500, "Groq API key not configured")
+        
+    client = Groq(api_key=GROQ_API_KEY)
+    
+    prompt = f"""
+You are an expert PMJAY medical AI assistant.
+The user has provided an unstructured medical history, symptoms, procedures, abbreviations, or diagnoses.
+Your job is to:
+1. Write a concise, professional summary of the case.
+2. Extract exactly 1-3 highly relevant clinical keywords (e.g., precise procedure names, diagnoses) that will be used to search for medical packages.
+
+User input: "{request.query}"
+
+Return ONLY a valid JSON object with the following schema:
+{{
+  "summary": "String containing the clinical summary",
+  "keywords": ["Keyword1", "Keyword2"]
+}}
+"""
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            response_format={"type": "json_object"}
+        )
+        
+        content = response.choices[0].message.content
+        parsed = json.loads(content)
+        
+        summary = parsed.get("summary", "No summary generated.")
+        keywords = parsed.get("keywords", [])
+        
+        if not keywords:
+            # Fallback if AI fails to extract
+            keywords = [request.query[:50]]
+            
+        return AnalyzeQueryResponse(summary=summary, keywords=keywords)
+    except Exception as e:
+        logger.error(f"Error analyzing query with Groq: {e}")
+        # Fallback
+        return AnalyzeQueryResponse(
+            summary=f"Query analysis failed but you can proceed. Original query: {request.query}",
+            keywords=[request.query]
+        )
 
 
 @app.post("/interactive-search/start", response_model=InteractiveSearchStartResponse)
