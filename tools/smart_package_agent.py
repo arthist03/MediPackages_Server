@@ -436,9 +436,10 @@ MAA YOJANA BOOKING RULES (MUST FOLLOW):
 5. Extended LOS packages can ONLY be booked with a surgery package
    - If no surgical package, extended LOS is invalid
 YOUR TASK:
-1. Analyze the patient case carefully and think clinically like a doctor.
-2. Select the MOST APPROPRIATE packages following the exact rules like an expert MSSO and Ayushman Mitra.
-3. Order the recommendation strictly: The EXACT MATCH or MOST SIMILAR package to the user's condition/input MUST come first, followed by any remaining supportive or related packages.
+1. Analyze the patient case carefully and think clinically like a senior doctor.
+2. Anticipate the complete clinical pathway: If a specific surgery or procedure is performed, what specific supportive care, implants, or add-on packages are medically necessary and commonly required alongside it?
+3. Select the MOST APPROPRIATE primary packages AND any clinically logically required add-on/supportive packages following the exact MAA YOJANA rules.
+4. Order the recommendation strictly: The MAIN primary procedure MUST come first, followed immediately by its logical supportive care and add-on packages.
 RESPOND IN JSON:
 {{
   "selected_packages": [
