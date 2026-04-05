@@ -880,7 +880,9 @@ async def send_push_notification(req: PushNotificationRequest, api_key: str = De
                     "android": {
                         "notification": {
                             "icon": msg.icon,
-                            "color": msg.color
+                            "color": msg.color,
+                            "channel_id": "admin_push_channel",
+                            "notification_priority": "PRIORITY_HIGH",
                         }
                     },
                     "apns": {
@@ -890,7 +892,12 @@ async def send_push_notification(req: PushNotificationRequest, api_key: str = De
                             }
                         }
                     },
+                    # Mirror title/body into data so the Flutter background handler
+                    # can intercept and show a local notification with the full
+                    # large icon (app_icon drawable) for ALL users in any app state.
                     "data": {
+                        "title": msg.title,
+                        "body": msg.body,
                         "click_action": "FLUTTER_NOTIFICATION_CLICK"
                     }
                 }

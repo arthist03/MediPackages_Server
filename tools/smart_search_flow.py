@@ -312,10 +312,32 @@ def generate_package_options(
     selected_tokens = _get_token_set(selected_procedure)
 
     ranking_tokens = list(selected_tokens)
-    if "angioplasty" in selected_lower:
-        ranking_tokens.extend(["ptca", "coronary", "stent", "pci"])
+    if "angioplasty" in selected_lower or "ptca" in selected_lower or "pci" in selected_lower:
+        ranking_tokens.extend(["ptca", "coronary", "stent", "pci", "angioplasty", "inclusive"])
+    if "stemi" in selected_lower or "heart attack" in selected_lower or "mi" in selected_lower:
+        ranking_tokens.extend(["ptca", "ptca inclusive", "angiogram", "stemi"])
     if "blood" in selected_lower or "transfusion" in selected_lower:
         ranking_tokens.extend(["blood", "transfusion", "platelet", "plasma", "packed", "cell"])
+    if "ivus" in selected_lower or "intravascular" in selected_lower:
+        ranking_tokens.extend(["ivus", "intravascular", "ultrasound"])
+    if "fasciotomy" in selected_lower or "amputation" in selected_lower or "limb" in selected_lower:
+        ranking_tokens.extend(["fasciotomy", "amputation", "limb", "loss"])
+    if "electrical" in selected_lower and ("high" in selected_lower or "voltage" in selected_lower):
+        ranking_tokens.extend(["high", "voltage", "electrical"])
+
+    # ── TBSA % range extraction (critical for burn package disambiguation) ──
+    import re as _re
+    _tbsa_pct = None
+    _tbsa_match = _re.search(r'(\d+)\s*%', selected_lower)
+    if _tbsa_match:
+        _tbsa_pct = int(_tbsa_match.group(1))
+
+    # ── Amputation/limb-loss flag (critical for electrical burns) ──
+    _has_amputation = any(t in selected_lower for t in
+                          ["amputation", "amputat", "limb loss", "part of limb", "limb amputat"])
+    _has_high_voltage = any(t in selected_lower for t in
+                            ["high voltage", "hv ", "high tension"])
+    _has_low_voltage = any(t in selected_lower for t in ["low voltage", "lv "])
 
     @lru_cache(maxsize=512)
     def relevance_score(pkg: tuple) -> tuple[int, int]:  # tuple for cacheable
@@ -356,7 +378,7 @@ def generate_package_options(
         is_blood_query = "blood" in selected_lower or "transfusion" in selected_lower
         if _ADDON_RE.search(name_n) and not is_blood_query:
             score -= 1
-        
+
         # Specific boost for blood standalone packages if requested explicitly
         if is_blood_query:
             if name.lower().startswith("blood transfusion") or name.lower().startswith("blood component"):
@@ -364,12 +386,62 @@ def generate_package_options(
             elif "blood transfusion" in name_n or "blood component" in name_n:
                 score += 200
 
-        # Angioplasty-specific smart boost
-        if "angioplasty" in selected_lower and "peripheral" not in selected_lower:
+        # ── PTCA / STEMI smart boost ────────────────────────────────────────
+        if "angioplasty" in selected_lower or "ptca" in selected_lower or "stemi" in selected_lower:
+            if "ptca" in name_n and "inclusive" in name_n and "diagnostic" in name_n:
+                score += 150   # strongly prefer "PTCA inclusive of diagnostic angiogram"
             if "ptca" in name_n or "coronary" in name_n:
                 score += 10
             if "peripheral" in name_n or "vascular" in spec_n:
                 score -= 6
+
+        # ── Angioplasty-specific smart boost (non-PTCA peripheral case) ────
+        if "angioplasty" in selected_lower and "peripheral" not in selected_lower and "ptca" not in selected_lower:
+            if "ptca" in name_n or "coronary" in name_n:
+                score += 10
+            if "peripheral" in name_n or "vascular" in spec_n:
+                score -= 6
+
+        # ── TBSA % range smart boost (fixes Test 1 ambiguity) ──────────────
+        if _tbsa_pct is not None and "tbsa" in name_n or "body surface" in name_n:
+            import re as _re2
+            # Extract range from package name e.g. "40 % - 60 %", "25-40", "upto 25"
+            _pkg_ranges = _re2.findall(r'(\d+)\s*[-to]+\s*(\d+)', name_n)
+            _pkg_upper = _re2.findall(r'up\s*to\s*(\d+)', name_n)
+            _pkg_above = _re2.findall(r'>\s*(\d+)', name_n)
+            matched_range = False
+            for lo, hi in _pkg_ranges:
+                if int(lo) <= _tbsa_pct <= int(hi):
+                    score += 500   # exact band match — huge boost
+                    matched_range = True
+                    break
+            if not matched_range and _pkg_upper:
+                if _tbsa_pct <= int(_pkg_upper[0]):
+                    score += 300
+                    matched_range = True
+            if not matched_range and _pkg_above:
+                if _tbsa_pct > int(_pkg_above[0]):
+                    score += 300
+                    matched_range = True
+            if not matched_range:
+                score -= 50  # different band — penalise
+
+        # ── Amputation / electrical burns smart scoring (fixes Test 3) ─────
+        if _has_amputation:
+            if "with part of limb" in name_n or "limb loss" in name_n or "with amputation" in name_n:
+                score += 300   # correct "WITH limb loss" package
+            if "without part of limb" in name_n or "without limb" in name_n:
+                score -= 200   # strongly penalise "WITHOUT" package
+        if _has_high_voltage:
+            if "high voltage" in name_n:
+                score += 100
+            if "low voltage" in name_n:
+                score -= 80
+        if _has_low_voltage:
+            if "low voltage" in name_n:
+                score += 100
+            if "high voltage" in name_n:
+                score -= 80
 
         return exact_priority, score
 
