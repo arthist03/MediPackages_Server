@@ -2302,6 +2302,7 @@ The user has provided an unstructured medical history, symptoms, procedures, abb
 Your job is to:
 1. Write a concise, professional summary of the case.
 2. Extract exactly 1-3 highly relevant clinical keywords (e.g., precise procedure names, diagnoses) that will be used to search for medical packages.
+3. IMPORTANT DEDUPLICATION: Do NOT include redundant terms, synonyms, or full names alongside their acronyms (e.g. if returning "CABG", do NOT also return "Coronary Artery Bypass Grafting"). Also do not extract a symptom if you also extract the definitive procedure treating it (e.g., if extracting "CABG", drop "Chest Pain"). Deduplicate into the core 1-2 root conditions/procedures.
 
 User input: "{request.query}"
 
