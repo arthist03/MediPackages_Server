@@ -586,9 +586,9 @@ def generate_stratification_options(main_package: Dict[str, Any], packages: List
 
 def _is_addon_package(pkg: Dict) -> bool:
     """Return True if package appears to be an add-on package."""
-    name = _get_pkg_name(pkg).upper()
-    cat = _get_pkg_cat(pkg).upper()
-    return bool('[ADD-ON' in name or '[ADD ON' in name or 'ADDON' in name or 'ADD-ON' in cat or 'ADD ON' in cat or 'ADDON' in cat)
+    name_clean = _get_pkg_name(pkg).upper().replace(" ", "").replace("-", "")
+    cat_clean = _get_pkg_cat(pkg).upper().replace(" ", "").replace("-", "")
+    return bool('[ADDON' in name_clean or 'ADDON' in cat_clean)
 
 
 def _is_standalone_pkg(pkg: Dict) -> bool:
@@ -663,7 +663,11 @@ def generate_addon_options(
     # If no matches found, fallback to generic supportive care in the same specialty
     base_specs = base_specialties or set()
     if not options and base_specs:
-        fallback_terms = ["icu", "care", "conservative", "management", "report", "investigation", "stay", "ward", "day"]
+        fallback_terms = [
+            "icu", "care", "conservative", "management", "report", "investigation", 
+            "stay", "ward", "day", "diagnostic", "imaging", "central line", 
+            "blood", "transfusion", "los", "extended", "biopsies", "serology", "thrombolysis"
+        ]
         for pkg in packages:
             code = pkg.get("PACKAGE CODE", "")
             if not code or code in seen_codes:
@@ -906,7 +910,7 @@ def build_search_flow(
     flow.add_step(SearchStep(
         step_number=len(flow.steps) + 1,
         step_name="Supportive Care & Add-ons",
-        description="Based on your selected clinical cases, these extra care packages may be needed:",
+        description="Related packages, supportive care, and pre/post-procedure options based on your selections:",
         options=final_options,
         requires_user_selection=True,
         context={"is_consolidated_addons": True}
