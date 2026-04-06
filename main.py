@@ -1505,8 +1505,9 @@ Find the single most relevant package for the query."""
 {base_rules}
 
 CRITICAL OUTPUT RULES:
-- Return ONLY 1-3 most relevant packages
-- Do NOT include packages that don't match the query
+- Return ONLY the exact, most highly related packages. NEVER return broad, loosely related categories.
+- STRICT LIMIT: Select ONLY the specific package(s) that exactly match the severity and procedure (e.g., if PTCA, only PTCA and its stent, no general checks).
+- Do NOT include generic or exploratory packages if a specific procedure is identified.
 - If blocked_rules has violations, set approval_likelihood to "REJECTED"
 - Be specific in doctor_summary - mention package code and why it was selected
 - In doctor_summary, include a brief 3-step clinical chain:
@@ -2146,8 +2147,9 @@ Return ONLY packages that will likely be APPROVED for this specific case."""
             [a.package_code for a in result.suggested_addons if a.package_code]
         )
 
-        # Include at most 6 alternatives after primary and add-ons.
-        alt_limit = 6
+        # DO NOT include broad fuzzy alternatives from the basic search. 
+        # Only include the explicit AI selections & AI's exact alternative codes.
+        alt_limit = 0
         alternatives_added: int = 0
         for pkg in all_relevant_packages:
             code = pkg.get("PACKAGE CODE", "")
