@@ -1180,14 +1180,17 @@ def _search_packages_basic(query: str, limit: int = 50) -> List[Dict[str, Any]]:
         code = _normalize_search_text(str(pkg.get("PACKAGE CODE", "")))
         spec = _normalize_search_text(
             str(pkg.get("SPECIALITY", pkg.get("Speciality", ""))))
+        strat = _normalize_search_text(str(pkg.get("STRATIFICATION PACKAGE", "")))
         name_tokens = _tokens(name)
         code_tokens = _tokens(code)
         spec_tokens = _tokens(spec)
+        strat_tokens = _tokens(strat)
 
         score: int = 0
         term_hits_name: int = 0
         term_hits_code: int = 0
         term_hits_spec: int = 0
+        term_hits_strat: int = 0
 
         # Score original terms higher
         for term in filtered_terms:
@@ -1200,6 +1203,9 @@ def _search_packages_basic(query: str, limit: int = 50) -> List[Dict[str, Any]]:
             if _has_term(term, spec, spec_tokens):
                 score = score + 5
                 term_hits_spec = term_hits_spec + 1
+            if _has_term(term, strat, strat_tokens):
+                score = score + 15
+                term_hits_strat = term_hits_strat + 1
 
         # Generic direct-match priority: most exact textual matches should always rank first.
         if normalized_query:
@@ -1209,6 +1215,8 @@ def _search_packages_basic(query: str, limit: int = 50) -> List[Dict[str, Any]]:
                 score = score + 75
             if normalized_query in spec:
                 score = score + 30
+            if normalized_query in strat:
+                score = score + 40
 
         exact_priority = 0
         if normalized_query:
@@ -1832,7 +1840,8 @@ async def smart_search(request: SmartSearchRequest):
             term_specialties[t] = list(specs)[:3]
             
         input_intents = _classify_input_intent(term_specialties)
-        violation = _check_intent_rule_violation(input_intents)
+        # LLM handles validation; no pre-blocking valid diagnosis + surgery combos
+        violation = None
         if violation:
             return SmartSearchResponse(
                 doctor_reasoning=f"⚠️ {violation}\n\nPlease revise your search. Under MAA Yojana rules, surgical procedures and medical management packages with ₹0 rate cannot be booked together.",
