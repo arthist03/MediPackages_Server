@@ -425,7 +425,18 @@ def _has_term(term: str, text: str, tokens: list[str]) -> bool:
     return any(tok == term or tok.startswith(term) for tok in tokens)
 
 
-def _search_packages_basic(query: str, limit: int = 50) -> list[dict]:
+def _passes_patient_type(pkg: dict, pt_type: str) -> bool:
+    if not pt_type: return True
+    name = str(pkg.get("PACKAGE NAME", "")).lower()
+    spec = str(pkg.get("SPECIALITY", "")).lower()
+    is_pedia = "pediatric" in name or "paediatric" in name or "pediatric" in spec or "neonatal" in spec
+    if pt_type.lower() == "pediatric":
+        return "adult" not in name or is_pedia
+    elif pt_type.lower() == "adult":
+        return not is_pedia
+    return True
+
+def _search_packages_basic(query: str, limit: int = 50, patient_type: str = "") -> list[dict]:
     """Score and rank packages against a clinical query string using pre-computed index."""
     _load_packages_cache()
     query_lower = _normalize_search_text(query)
@@ -463,6 +474,9 @@ def _search_packages_basic(query: str, limit: int = 50) -> list[dict]:
 
     for idx_entry in _search_index:
         pkg = idx_entry["pkg"]
+        if not _passes_patient_type(pkg, patient_type):
+            continue
+
         name = idx_entry["name"];      name_tok = idx_entry["name_tok"]
         code = idx_entry["code"];      code_tok = idx_entry["code_tok"]
         spec = idx_entry["spec"];      spec_tok = idx_entry["spec_tok"]
@@ -1012,7 +1026,10 @@ class InteractiveSearchStartRequest(BaseModel):
     disease: str = ""
     symptoms: list[str] = []
     patient_age: int = 0
+    symptoms: list[str] = []
+    patient_age: int = 0
     patient_gender: str = ""
+    patient_type: str = ""
 
 
 class InteractiveSearchStartResponse(BaseModel):
@@ -1422,13 +1439,13 @@ async def smart_search(request: SmartSearchRequest):
         logger.warning("Clinical pathway lookup failed: %s", e)
 
     limit = max(25, min(100, request.limit))
-    relevant = _search_packages_basic(main_term, limit=limit)
+    relevant = _search_packages_basic(main_term, limit=limit, patient_type=request.patient_type if hasattr(request, 'patient_type') else "")
     relevant = _prioritize_exact_main_term_first(relevant, main_term)
 
     addon_pkgs: list[dict] = []
     addon_by_term: dict[str, list[dict]] = {}
     for at in addon_terms:
-        res = _search_packages_basic(at, limit=30)
+        res = _search_packages_basic(at, limit=30, patient_type=request.patient_type if hasattr(request, 'patient_type') else "")
         addon_by_term[at] = res
         addon_pkgs.extend(res)
 
@@ -1738,11 +1755,12 @@ async def start_interactive_search(request: InteractiveSearchStartRequest):
 
     main_term = terms[0]
     addon_terms = terms[1:]
+    pt_type = request.patient_type
 
-    matching = _prioritize_exact_main_term_first(_search_packages_basic(main_term, 200), main_term)
+    matching = _prioritize_exact_main_term_first(_search_packages_basic(main_term, 200, patient_type=pt_type), main_term)
     if request.disease:
         seen = {pkg_code(p) for p in matching}
-        for p in _search_packages_basic(request.disease, 120):
+        for p in _search_packages_basic(request.disease, 120, patient_type=pt_type):
             if pkg_code(p) not in seen:
                 matching.append(p)
 
@@ -1757,8 +1775,9 @@ async def start_interactive_search(request: InteractiveSearchStartRequest):
             for p in all_pkgs:
                 c = pkg_code(p)
                 if c and c not in seen_c and any(s.lower() in pkg_specialty(p).lower() for s in specs):
-                    matching.append(p)
-                    seen_c.add(c)
+                    if _passes_patient_type(p, pt_type):
+                        matching.append(p)
+                        seen_c.add(c)
             matching = matching[:250]
 
     if not matching:
@@ -1768,12 +1787,12 @@ async def start_interactive_search(request: InteractiveSearchStartRequest):
     all_pkgs = _packages_cache + _robotic_cache
     per_term: dict[str, list] = {main_term: matching}
     for t in addon_terms:
-        tp = _prioritize_exact_main_term_first(_search_packages_basic(t, 200), t)
+        tp = _prioritize_exact_main_term_first(_search_packages_basic(t, 200, patient_type=pt_type), t)
         if not tp:
             tl = t.lower()
             toks = [tok for tok in _tokenize(tl) if len(tok) > 2]
             if toks:
-                tp = [p for p in all_pkgs if any(tok in f"{pkg_name(p).lower()} {pkg_specialty(p).lower()}" for tok in toks)][:200]
+                tp = [p for p in all_pkgs if any(tok in f"{pkg_name(p).lower()} {pkg_specialty(p).lower()}" for tok in toks) and _passes_patient_type(p, pt_type)][:200]
         per_term[t] = tp
 
     # Intent check
