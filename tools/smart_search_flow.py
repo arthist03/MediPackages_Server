@@ -37,7 +37,13 @@ logger = logging.getLogger("smart_search_flow")
 # ═══════════════════════════════════════════════════════════════════════════════
 _GENERIC_TERMS = {"surgery", "surgical", "procedure", "operation", "management", "approach",
                   "general", "specialty", "select", "main", "package", "phase", "stage",
-                  "level", "type", "pain", "ache", "discomfort", "symptom", "disease"}
+                  "level", "type", "pain", "ache", "discomfort", "symptom", "disease",
+                  "replacement", "repair", "removal", "treatment", "therapy", "care",
+                  "evaluation", "test", "scan", "with", "without", "inclusive",
+                  "transplant", "transplantation", "bypass", "excision", "biopsy", 
+                  "incision", "graft", "implant", "resection", "scan", "xray", 
+                  "ultrasound", "mri", "ct", "test", "angiography", "stent", 
+                  "disease", "syndrome", "disorder", "acute", "chronic", "severe", "mild"}
 
 _SURGICAL_KEYWORDS_RE = re.compile(
     r'(?:surgical|surgery|operative|ectomy|plasty|otomy|procedure)', re.IGNORECASE
@@ -403,7 +409,7 @@ def generate_package_options(
                 score -= 6
 
         # ── TBSA % range smart boost (fixes Test 1 ambiguity) ──────────────
-        if _tbsa_pct is not None and "tbsa" in name_n or "body surface" in name_n:
+        if _tbsa_pct is not None and ("tbsa" in name_n or "body surface" in name_n):
             import re as _re2
             # Extract range from package name e.g. "40 % - 60 %", "25-40", "upto 25"
             _pkg_ranges = _re2.findall(r'(\d+)\s*[-to]+\s*(\d+)', name_n)
@@ -474,7 +480,16 @@ def generate_package_options(
         _, pkg_score = relevance_score((
             code, name, _get_pkg_spec(pkg), category
         ))
-        if pkg_score <= 0:
+        
+        # STRICT FILTERING: Prevent unrelated "extra packages" from padding the list.
+        meaningful_hits = selected_tokens & _get_token_set(name) - _GENERIC_TERMS
+        has_strong_match = (
+            pkg_score >= 24 or           # Has direct term match in name/code/spec
+            len(meaningful_hits) > 0 or  # Has overlapping informative tokens
+            pkg_score >= 100             # Has a manual rule boost (like STEMI -> PTCA)
+        )
+        
+        if pkg_score <= 0 or not has_strong_match:
             continue
 
         seen_codes.add(code)

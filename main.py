@@ -42,7 +42,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security.api_key import APIKeyHeader
-from groq import Groq
+from groq import Groq, AsyncGroq
+import functools
 from PIL import Image
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -81,6 +82,7 @@ SESSION_TTL_SECONDS = 3600
 # ═══════════════════════════════════════════════════════════════════════
 _pipeline = None
 _groq_client: Groq | None = None
+_async_groq_client: AsyncGroq | None = None
 _pending_sessions: dict[str, dict] = {}
 _interactive_flows: dict[str, Any] = {}
 _packages_cache: list[dict] = []
@@ -425,18 +427,42 @@ def _has_term(term: str, text: str, tokens: list[str]) -> bool:
     return any(tok == term or tok.startswith(term) for tok in tokens)
 
 
+_PEDIA_KEYWORDS = (
+    "pediatric", "paediatric", "neonatal", "neonate", "neonat",
+    "children", "child", "infant", "infantile", "newborn",
+    "juvenile", "toddler", "baby",
+)
+
+def _is_pediatric_package(name: str, spec: str) -> bool:
+    """Return True if the package is clearly pediatric / child-specific."""
+    combined = f"{name} {spec}"
+    return any(kw in combined for kw in _PEDIA_KEYWORDS)
+
+
 def _passes_patient_type(pkg: dict, pt_type: str) -> bool:
-    if not pt_type: return True
+    """Filter packages based on patient demographic (Adult vs Pediatric)."""
+    if not pt_type:
+        return True
     name = str(pkg.get("PACKAGE NAME", "")).lower()
     spec = str(pkg.get("SPECIALITY", "")).lower()
-    is_pedia = "pediatric" in name or "paediatric" in name or "pediatric" in spec or "neonatal" in spec
-    if pt_type.lower() == "pediatric":
-        return "adult" not in name or is_pedia
-    elif pt_type.lower() == "adult":
+    is_pedia = _is_pediatric_package(name, spec)
+
+    if pt_type.lower() == "adult":
+        # Exclude packages that are clearly pediatric/child-specific
         return not is_pedia
+    elif pt_type.lower() == "pediatric":
+        # Include pediatric packages + general packages; exclude explicit "adult" only packages
+        if is_pedia:
+            return True
+        # Exclude packages that explicitly say "adult" in their name
+        if "adult" in name:
+            return False
+        # Allow general packages (not explicitly adult, not explicitly pediatric)
+        return True
     return True
 
-def _search_packages_basic(query: str, limit: int = 50, patient_type: str = "") -> list[dict]:
+@functools.lru_cache(maxsize=1024)
+def _cached_search_packages_basic(query: str, limit: int = 50, patient_type: str = "") -> list[dict]:
     """Score and rank packages against a clinical query string using pre-computed index."""
     _load_packages_cache()
     query_lower = _normalize_search_text(query)
@@ -567,6 +593,12 @@ def _search_packages_basic(query: str, limit: int = 50, patient_type: str = "") 
     return [p for _, _, p in scored[:limit]]
 
 
+def _search_packages_basic(query: str, limit: int = 50, patient_type: str = "") -> list[dict]:
+    """Wrapper to retrieve cached search results safely."""
+    # We return a shallow copy to protect the internal LRU cache from mutation
+    return list(_cached_search_packages_basic(query, limit, patient_type))
+
+
 def _prioritize_exact_main_term_first(packages: list[dict], main_term: str) -> list[dict]:
     """Stable re-sort: exact main-term hits bubble to top."""
     norm = _normalize_search_text(main_term or "")
@@ -679,9 +711,9 @@ Return ONLY valid JSON:
 }}"""
 
 
-def _classify_input_intent(term_specialties_map: dict[str, list[str]]) -> dict[str, str]:
+async def _classify_input_intent(term_specialties_map: dict[str, list[str]]) -> dict[str, str]:
     """Classify terms as Surgical / Medical using deterministic rules then Groq fallback."""
-    if not _groq_client or not term_specialties_map:
+    if not _async_groq_client or not term_specialties_map:
         return {t: "Unknown" for t in term_specialties_map}
 
     intents: dict[str, str] = {}
@@ -712,7 +744,7 @@ Surgical = requires operation. Medical = conservative/management.
 Return ONLY JSON: {{"term": "Surgical"|"Medical", ...}}"""
 
     try:
-        resp = _groq_client.chat.completions.create(
+        resp = await _async_groq_client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
@@ -838,7 +870,7 @@ async def _run_pipeline_async(state: dict | None, config: dict) -> dict:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _pipeline, _groq_client
+    global _pipeline, _groq_client, _async_groq_client
     gc.collect()
 
     from config.settings import FIREBASE_SERVICE_ACCOUNT
@@ -846,7 +878,8 @@ async def lifespan(app: FastAPI):
         logger.error("⚠️ GROQ_API_KEY not set! https://console.groq.com/keys")
     else:
         _groq_client = Groq(api_key=GROQ_API_KEY)
-        logger.info("✅ Groq API key configured — client initialised")
+        _async_groq_client = AsyncGroq(api_key=GROQ_API_KEY)
+        logger.info("✅ Groq API keys configured — clients initialised")
 
     if not FIREBASE_SERVICE_ACCOUNT:
         logger.warning("⚠️ FIREBASE_SERVICE_ACCOUNT not set – push notifications disabled")
@@ -1024,8 +1057,6 @@ class InteractiveSearchStartRequest(BaseModel):
     query: str
     procedure: str = ""
     disease: str = ""
-    symptoms: list[str] = []
-    patient_age: int = 0
     symptoms: list[str] = []
     patient_age: int = 0
     patient_gender: str = ""
@@ -1455,7 +1486,7 @@ async def smart_search(request: SmartSearchRequest):
         for t in query_terms:
             pkgs = addon_by_term.get(t, relevant[:15] if t == main_term else [])
             ts[t] = list({pkg_specialty(p).strip() for p in pkgs[:15] if pkg_specialty(p).strip()})[:3]
-        _classify_input_intent(ts)  # logged but not blocking (LLM handles validation)
+        await _classify_input_intent(ts)  # logged but not blocking (LLM handles validation)
 
     # Combine keeping main first
     all_relevant = relevant.copy()
@@ -1473,7 +1504,7 @@ async def smart_search(request: SmartSearchRequest):
 
     # AI package selection via Groq
     try:
-        if not _groq_client:
+        if not _async_groq_client:
             raise ValueError("Groq client not initialised")
 
         ctx = _format_packages_for_ai(all_relevant[:25])
@@ -1496,7 +1527,7 @@ AVAILABLE PACKAGES:
 Select BEST matching package(s). First term "{main_term}" = MAIN. Additional terms = ADD-ONS.
 Return ONLY approved-likely packages."""
 
-        resp = _groq_client.chat.completions.create(
+        resp = await _async_groq_client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[{"role": "system", "content": _get_ai_system_prompt(request.mode or "smart")},
                       {"role": "user", "content": user_prompt}],
@@ -1679,29 +1710,35 @@ async def _get_or_reconstruct_flow(session_id: str) -> tuple[Any, list[dict], di
     query = data.get("query", "")
     addon_terms = data.get("addon_terms", [])
     sels = data.get("selections_list", [])
+    pt_type = data.get("patient_type", "")
 
     _load_packages_cache()
     all_pkgs = _packages_cache + _robotic_cache
-    matching = _prioritize_exact_main_term_first(_search_packages_basic(query, 200), query)
+    if pt_type:
+        all_pkgs = [p for p in all_pkgs if _passes_patient_type(p, pt_type)]
+        
+    matching = _prioritize_exact_main_term_first(_search_packages_basic(query, 200, patient_type=pt_type), query)
     per_term: dict[str, list] = {query: matching}
     for t in addon_terms:
-        per_term[t] = _prioritize_exact_main_term_first(_search_packages_basic(t, 200), t)
+        per_term[t] = _prioritize_exact_main_term_first(_search_packages_basic(t, 200, patient_type=pt_type), t)
 
     flow = reconstruct_flow_from_state(query=query, addon_terms=addon_terms, selections=sels,
                                        matching_packages=matching, all_packages=all_pkgs, per_term_packages=per_term)
     _interactive_flows[session_id] = {
         "flow": flow, "packages": matching, "all_packages": all_pkgs,
         "per_term_packages": per_term, "created_at": time.time(), "selections_list": sels,
+        "request": {"query": query, "patient_type": pt_type},
     }
     return flow, all_pkgs, per_term
 
 
-def _sync_session_db(session_id: str, flow: Any, sels: list[dict]):
+def _sync_session_db(session_id: str, flow: Any, sels: list[dict], pt_type: str = ""):
     try:
         from memory.sqlite_store import AgentMemory
         AgentMemory().save_session(session_id, "interactive_search", {
             "query": flow.query, "addon_terms": [t for t in flow.parsed_terms if t != flow.query],
             "selections_list": sels, "flow_complete": flow.flow_complete,
+            "patient_type": pt_type,
         })
     except Exception as e:
         logger.error("Failed to sync session: %s", e)
@@ -1710,21 +1747,29 @@ def _sync_session_db(session_id: str, flow: Any, sels: list[dict]):
 @app.post("/interactive-search/analyze-query", response_model=AnalyzeQueryResponse)
 async def analyze_interactive_query(request: AnalyzeQueryRequest):
     """NLP analysis of free-text patient history → clinical keywords."""
-    if not _groq_client:
+    if not _async_groq_client:
         raise HTTPException(500, "Groq client not initialised")
 
     prompt = f"""You are an expert PMJAY medical AI.
 Given unstructured medical history, extract:
-1. Concise professional summary
+1. Concise professional summary (1-2 sentences)
 2. 1-3 precise clinical keywords (procedures/diagnoses) for package search
-3. DEDUPLICATE: no synonyms, no acronym+full-name pairs, no symptom if procedure covers it
+3. IMPORTANT RULES:
+   - EXPAND all medical abbreviations/short forms to their FULL form in the keywords
+     Examples: CABG → Coronary Artery Bypass Grafting, TKR → Total Knee Replacement,
+     PTCA → Percutaneous Transluminal Coronary Angioplasty, ASD → Atrial Septal Defect,
+     TURP → Transurethral Resection of Prostate, MVR → Mitral Valve Replacement,
+     AVR → Aortic Valve Replacement, ERCP → Endoscopic Retrograde Cholangiopancreatography,
+     LSCS → Lower Segment Caesarean Section, ORIF → Open Reduction Internal Fixation
+   - DEDUPLICATE: no synonyms, no acronym+full-name pairs, no symptom if procedure covers it
+   - Keywords must be the FULL expanded medical term, never an abbreviation
 
 Input: "{request.query}"
 
 Return ONLY JSON: {{"summary": "...", "keywords": ["..."]}}"""
 
     try:
-        resp = _groq_client.chat.completions.create(
+        resp = await _async_groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0, response_format={"type": "json_object"},
@@ -1742,96 +1787,107 @@ Return ONLY JSON: {{"summary": "...", "keywords": ["..."]}}"""
 @app.post("/interactive-search/start", response_model=InteractiveSearchStartResponse)
 async def start_interactive_search(request: InteractiveSearchStartRequest):
     """Start multi-step interactive package selection flow."""
-    from tools.smart_search_flow import build_search_flow, _split_query_terms as flow_split, advance_past_empty_optional_steps
+    try:
+        from tools.smart_search_flow import build_search_flow, _split_query_terms as flow_split, advance_past_empty_optional_steps
 
-    terms = flow_split(request.query)
-    if request.procedure:
-        terms.insert(0, request.procedure)
-    if request.disease and request.disease not in terms:
-        terms.append(request.disease)
-    terms, corrections = _correct_query_terms_spelling(terms)
-    if not terms:
-        raise HTTPException(400, "Please provide a query, procedure, or disease")
+        terms = flow_split(request.query)
+        if request.procedure:
+            terms.insert(0, request.procedure)
+        if request.disease and request.disease not in terms:
+            terms.append(request.disease)
+        terms, corrections = _correct_query_terms_spelling(terms)
+        if not terms:
+            raise HTTPException(400, "Please provide a query, procedure, or disease")
 
-    main_term = terms[0]
-    addon_terms = terms[1:]
-    pt_type = request.patient_type
+        main_term = terms[0]
+        addon_terms = terms[1:]
+        pt_type = request.patient_type
 
-    matching = _prioritize_exact_main_term_first(_search_packages_basic(main_term, 200, patient_type=pt_type), main_term)
-    if request.disease:
-        seen = {pkg_code(p) for p in matching}
-        for p in _search_packages_basic(request.disease, 120, patient_type=pt_type):
-            if pkg_code(p) not in seen:
-                matching.append(p)
+        matching = _prioritize_exact_main_term_first(_search_packages_basic(main_term, 200, patient_type=pt_type), main_term)
+        if request.disease:
+            seen = {pkg_code(p) for p in matching}
+            for p in _search_packages_basic(request.disease, 120, patient_type=pt_type):
+                if pkg_code(p) not in seen:
+                    matching.append(p)
 
-    if not matching:
+        if not matching:
+            _load_packages_cache()
+            all_pkgs = _packages_cache + _robotic_cache
+            if not all_pkgs:
+                raise HTTPException(503, "Package datasets not loaded.")
+            specs = get_specialties_for_term(main_term)
+            if specs:
+                seen_c: set[str] = set()
+                for p in all_pkgs:
+                    c = pkg_code(p)
+                    if c and c not in seen_c and any(s.lower() in pkg_specialty(p).lower() for s in specs):
+                        if _passes_patient_type(p, pt_type):
+                            matching.append(p)
+                            seen_c.add(c)
+                matching = matching[:250]
+
+        if not matching:
+            raise HTTPException(404, f"No packages found for: {main_term}")
+
         _load_packages_cache()
         all_pkgs = _packages_cache + _robotic_cache
-        if not all_pkgs:
-            raise HTTPException(503, "Package datasets not loaded.")
-        specs = get_specialties_for_term(main_term)
-        if specs:
-            seen_c: set[str] = set()
-            for p in all_pkgs:
-                c = pkg_code(p)
-                if c and c not in seen_c and any(s.lower() in pkg_specialty(p).lower() for s in specs):
-                    if _passes_patient_type(p, pt_type):
-                        matching.append(p)
-                        seen_c.add(c)
-            matching = matching[:250]
+        # ── Apply patient-type filter to the entire pool ──
+        if pt_type:
+            all_pkgs = [p for p in all_pkgs if _passes_patient_type(p, pt_type)]
 
-    if not matching:
-        raise HTTPException(404, f"No packages found for: {main_term}")
+        per_term: dict[str, list] = {main_term: matching}
+        for t in addon_terms:
+            tp = _prioritize_exact_main_term_first(_search_packages_basic(t, 200, patient_type=pt_type), t)
+            if not tp:
+                tl = t.lower()
+                toks = [tok for tok in _tokenize(tl) if len(tok) > 2]
+                if toks:
+                    tp = [p for p in all_pkgs if any(tok in f"{pkg_name(p).lower()} {pkg_specialty(p).lower()}" for tok in toks)][:200]
+            per_term[t] = tp
 
-    _load_packages_cache()
-    all_pkgs = _packages_cache + _robotic_cache
-    per_term: dict[str, list] = {main_term: matching}
-    for t in addon_terms:
-        tp = _prioritize_exact_main_term_first(_search_packages_basic(t, 200, patient_type=pt_type), t)
-        if not tp:
-            tl = t.lower()
-            toks = [tok for tok in _tokenize(tl) if len(tok) > 2]
-            if toks:
-                tp = [p for p in all_pkgs if any(tok in f"{pkg_name(p).lower()} {pkg_specialty(p).lower()}" for tok in toks) and _passes_patient_type(p, pt_type)][:200]
-        per_term[t] = tp
+        # Intent check
+        violation_msg = None
+        if len(terms) > 1:
+            ts = {}
+            for t in terms:
+                pkgs = per_term.get(t, matching[:15] if t == main_term else [])
+                ts[t] = list({pkg_specialty(p).strip() for p in pkgs[:15] if pkg_specialty(p).strip()})[:3]
+            violation_msg = _check_intent_rule_violation(await _classify_input_intent(ts))
 
-    # Intent check
-    violation_msg = None
-    if len(terms) > 1:
-        ts = {}
-        for t in terms:
-            pkgs = per_term.get(t, matching[:15] if t == main_term else [])
-            ts[t] = list({pkg_specialty(p).strip() for p in pkgs[:15] if pkg_specialty(p).strip()})[:3]
-        violation_msg = _check_intent_rule_violation(_classify_input_intent(ts))
+        flow = build_search_flow(main_term, addon_terms, matching,
+                                 all_packages_for_addons=all_pkgs, per_term_packages=per_term)
+        advance_past_empty_optional_steps(flow)
+        _auto_advance_single_option_steps(flow, all_pkgs)
 
-    flow = build_search_flow(main_term, addon_terms, matching,
-                             all_packages_for_addons=all_pkgs, per_term_packages=per_term)
-    advance_past_empty_optional_steps(flow)
-    _auto_advance_single_option_steps(flow, all_pkgs)
+        sid = str(uuid.uuid4())
+        _interactive_flows[sid] = {
+            "flow": flow, "packages": matching, "all_packages": all_pkgs,
+            "per_term_packages": per_term, "created_at": time.time(), "selections_list": [],
+            "request": {"query": request.query, "procedure": request.procedure,
+                         "disease": request.disease, "symptoms": request.symptoms,
+                         "patient_age": request.patient_age, "patient_gender": request.patient_gender,
+                         "patient_type": pt_type},
+        }
+        _sync_session_db(sid, flow, [], pt_type=pt_type)
 
-    sid = str(uuid.uuid4())
-    _interactive_flows[sid] = {
-        "flow": flow, "packages": matching, "all_packages": all_pkgs,
-        "per_term_packages": per_term, "created_at": time.time(), "selections_list": [],
-        "request": {"query": request.query, "procedure": request.procedure,
-                     "disease": request.disease, "symptoms": request.symptoms,
-                     "patient_age": request.patient_age, "patient_gender": request.patient_gender},
-    }
-    _sync_session_db(sid, flow, [])
+        first = flow.steps[flow.current_step] if flow.steps and flow.current_step < len(flow.steps) else None
+        if not first:
+            raise HTTPException(500, "Failed to build search flow")
 
-    first = flow.steps[flow.current_step] if flow.steps and flow.current_step < len(flow.steps) else None
-    if not first:
-        raise HTTPException(500, "Failed to build search flow")
+        msg_parts = []
+        if violation_msg: msg_parts.append(violation_msg)
+        if corrections: msg_parts.append(f"Did you mean: {', '.join(corrections.values())}?")
+        msg_parts.append(f"Starting search for: {main_term}. Found {len(matching)} packages.")
 
-    msg_parts = []
-    if violation_msg: msg_parts.append(violation_msg)
-    if corrections: msg_parts.append(f"Did you mean: {', '.join(corrections.values())}?")
-    msg_parts.append(f"Starting search for: {main_term}. Found {len(matching)} packages.")
-
-    return InteractiveSearchStartResponse(
-        session_id=sid, query=request.query, parsed_terms=terms,
-        current_step=_step_to_response(first), message=" | ".join(msg_parts),
-    )
+        return InteractiveSearchStartResponse(
+            session_id=sid, query=request.query, parsed_terms=terms,
+            current_step=_step_to_response(first), message=" | ".join(msg_parts),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("start_interactive_search crashed: %s", e, exc_info=True)
+        raise HTTPException(500, f"Internal error: {str(e)}")
 
 
 @app.get("/interactive-search/{session_id}/step")
@@ -1863,7 +1919,8 @@ async def submit_step_selection(session_id: str, selection: SelectionRequest):
     sels = _interactive_flows[session_id].get("selections_list", [])
     sels.append({"id": selection.option_id, "notes": selection.notes, "manual_package": selection.manual_package})
     _interactive_flows[session_id]["selections_list"] = sels
-    _sync_session_db(session_id, flow, sels)
+    _pt = _interactive_flows.get(session_id, {}).get("request", {}).get("patient_type", "")
+    _sync_session_db(session_id, flow, sels, pt_type=_pt)
     _auto_advance_single_option_steps(flow, pkgs)
 
     if flow.flow_complete:
@@ -1887,7 +1944,8 @@ async def undo_step_selection(session_id: str):
         sels = _interactive_flows[session_id].get("selections_list", [])
         if sels: sels.pop()
         _interactive_flows[session_id]["selections_list"] = sels
-        _sync_session_db(session_id, flow, sels)
+        _pt = _interactive_flows.get(session_id, {}).get("request", {}).get("patient_type", "")
+        _sync_session_db(session_id, flow, sels, pt_type=_pt)
 
     if not ok:
         return JSONResponse(status_code=400, content={"success": False, "message": msg})
