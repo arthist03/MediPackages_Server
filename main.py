@@ -91,6 +91,8 @@ _all_packages_cache: list[dict] = []
 _search_index: list[dict] = []
 _spelling_vocab_cache: set[str] = set()
 _spelling_vocab_list_cache: list[str] = []
+_abbrev_expansion_cache: dict[str, str] = {}
+
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -268,6 +270,11 @@ async def _expand_abbreviations_llm(text: str) -> str:
     if not text or len(text.strip()) > 100 or not _async_groq_client:
         return text
 
+    # Check cache first
+    cached = _abbrev_expansion_cache.get(text.lower())
+    if cached:
+        return cached
+
     words = text.split()
     possible_abbrev = False
     for w in words:
@@ -313,7 +320,11 @@ Output:"""
             
         if expanded and expanded.lower() != text.lower() and len(expanded) > len(text):
             logger.info("LLM Expanded Abbreviation: '%s' -> '%s'", text, expanded)
+            _abbrev_expansion_cache[text.lower()] = expanded
             return expanded
+        
+        # Cache failed or unexpanded results to avoid retrying
+        _abbrev_expansion_cache[text.lower()] = text
     except Exception as e:
         logger.warning("LLM abbreviation expansion failed: %s", e)
     return text
@@ -651,8 +662,10 @@ def _cached_search_packages_basic(query: str, limit: int = 50, patient_type: str
 
 def _search_packages_basic(query: str, limit: int = 50, patient_type: str = "") -> list[dict]:
     """Wrapper to retrieve cached search results safely."""
+    # Normalize before caching to maximize cache hits
+    normalized_query = _normalize_search_text(query)
     # We return a shallow copy to protect the internal LRU cache from mutation
-    return list(_cached_search_packages_basic(query, limit, patient_type))
+    return list(_cached_search_packages_basic(normalized_query, limit, patient_type))
 
 
 def _prioritize_exact_main_term_first(packages: list[dict], main_term: str) -> list[dict]:
@@ -1545,12 +1558,8 @@ async def smart_search(request: SmartSearchRequest):
         addon_pkgs.extend(res)
 
     # Intent classification for multi-term queries
-    if len(query_terms) > 1:
-        ts = {}
-        for t in query_terms:
-            pkgs = addon_by_term.get(t, relevant[:15] if t == main_term else [])
-            ts[t] = list({pkg_specialty(p).strip() for p in pkgs[:15] if pkg_specialty(p).strip()})[:3]
-        await _classify_input_intent(ts)  # logged but not blocking (LLM handles validation)
+    # Removed blocking await _classify_input_intent(ts) as it was mostly ignored and caused delays
+    # Validation is already handled by the Groq prompt later for overall combination rules.
 
     # Combine keeping main first
     all_relevant = relevant.copy()
@@ -1560,6 +1569,17 @@ async def smart_search(request: SmartSearchRequest):
         if c not in seen:
             all_relevant.append(p)
             seen.add(c)
+
+    # For AI, we need to balance showing main packages vs add-on packages to ensure all search terms are considered
+    ai_context_pkgs = relevant[:12]
+    seen_ctx = {pkg_code(p) for p in ai_context_pkgs}
+    for p in addon_pkgs:
+        c = pkg_code(p)
+        if c not in seen_ctx:
+            ai_context_pkgs.append(p)
+            seen_ctx.add(c)
+        if len(ai_context_pkgs) >= 30:
+            break
 
     if not relevant:
         hint = f" Did you mean: {', '.join(spelling_corrections.values())}?" if spelling_corrections else ""
@@ -1571,7 +1591,7 @@ async def smart_search(request: SmartSearchRequest):
         if not _async_groq_client:
             raise ValueError("Groq client not initialised")
 
-        ctx = _format_packages_for_ai(all_relevant[:25])
+        ctx = _format_packages_for_ai(ai_context_pkgs, n=30)
         symptoms_str = ", ".join(request.symptoms) if request.symptoms else "None"
         addon_hint = f"\n- Add-on procedures: {', '.join(addon_terms)}" if addon_terms else ""
 
@@ -1834,7 +1854,7 @@ Return ONLY JSON: {{"summary": "...", "keywords": ["..."]}}"""
 
     try:
         resp = await _async_groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="openai/gpt-oss-120b",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0, response_format={"type": "json_object"},
         )
