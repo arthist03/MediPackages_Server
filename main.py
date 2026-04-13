@@ -282,15 +282,20 @@ async def _expand_abbreviations_llm(text: str) -> str:
     if not possible_abbrev:
         return text
 
-    prompt = f"""You are an expert Indian clinical assistant. Look at this short medical query. If it contains any medical abbreviations (like BTKR, LAP CHOLE, PCNL, LSCS, appy, etc), expand them to their full medical terms. Keep non-abbreviation words exactly the same. Do not write any explanations, just output the expanded text. If no abbreviations exist, return the original text.
-Examples:
-"LAP CHOLE" -> "Laparoscopic Cholecystectomy"
-"BTKR" -> "Bilateral Total Knee Replacement"
-"PTCA" -> "Percutaneous Transluminal Coronary Angioplasty"
-"appy" -> "Appendectomy"
+    prompt = f"""Expand medical abbreviations in this query to their full PMJAY/Indian clinical terminology.
+CRITICAL: DO NOT write any explanations. DO NOT use conversational language. ONLY output the final translated query.
 
-Query: "{text}"
-Expanded Query:"""
+Input: LAP CHOLE
+Output: Laparoscopic Cholecystectomy
+
+Input: PTCA
+Output: Percutaneous Transluminal Coronary Angioplasty
+
+Input: TKR
+Output: Total Knee Replacement
+
+Input: {text}
+Output:"""
     try:
         resp = await _async_groq_client.chat.completions.create(
             model=GROQ_MODEL,
@@ -298,7 +303,14 @@ Expanded Query:"""
             temperature=0,
             max_tokens=60,
         )
-        expanded = resp.choices[0].message.content.strip().strip('"').strip("'")
+        # Parse only the first line to strip trailing explanations if the LLM ignores instructions
+        expanded = resp.choices[0].message.content.strip().split('\n')[0].strip('"').strip("'")
+        
+        # Hard safety bounds: If the output is suspiciously long, conversational, or contains weird characters, revert.
+        if len(expanded) > len(text) + 50 or "since " in expanded.lower() or "assume " in expanded.lower() or "however" in expanded.lower():
+            logger.warning("Rejected hallucinatory abbreviation expansion: '%s'", expanded)
+            return text
+            
         if expanded and expanded.lower() != text.lower() and len(expanded) > len(text):
             logger.info("LLM Expanded Abbreviation: '%s' -> '%s'", text, expanded)
             return expanded
