@@ -263,6 +263,50 @@ def _normalize_padded(value: str) -> str:
     return f" {' '.join((value or '').lower().replace('/', ' ').replace('-', ' ').split())} "
 
 
+async def _expand_abbreviations_llm(text: str) -> str:
+    """Uses LLM to dynamically expand medical abbreviations in Indian clinical context."""
+    if not text or len(text.strip()) > 100 or not _async_groq_client:
+        return text
+
+    words = text.split()
+    possible_abbrev = False
+    for w in words:
+        clean = re.sub(r'[^a-zA-Z]', '', w)
+        if 2 <= len(clean) <= 5 and clean.isupper():
+            possible_abbrev = True
+            break
+        if 2 <= len(clean) <= 4 and clean.lower() not in {"and", "the", "for", "with", "pain", "leg", "arm", "eye", "ear", "cut", "burn"}:
+            possible_abbrev = True
+            break
+            
+    if not possible_abbrev:
+        return text
+
+    prompt = f"""You are an expert Indian clinical assistant. Look at this short medical query. If it contains any medical abbreviations (like BTKR, LAP CHOLE, PCNL, LSCS, appy, etc), expand them to their full medical terms. Keep non-abbreviation words exactly the same. Do not write any explanations, just output the expanded text. If no abbreviations exist, return the original text.
+Examples:
+"LAP CHOLE" -> "Laparoscopic Cholecystectomy"
+"BTKR" -> "Bilateral Total Knee Replacement"
+"PTCA" -> "Percutaneous Transluminal Coronary Angioplasty"
+"appy" -> "Appendectomy"
+
+Query: "{text}"
+Expanded Query:"""
+    try:
+        resp = await _async_groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            max_tokens=60,
+        )
+        expanded = resp.choices[0].message.content.strip().strip('"').strip("'")
+        if expanded and expanded.lower() != text.lower() and len(expanded) > len(text):
+            logger.info("LLM Expanded Abbreviation: '%s' -> '%s'", text, expanded)
+            return expanded
+    except Exception as e:
+        logger.warning("LLM abbreviation expansion failed: %s", e)
+    return text
+
+
 def _build_spelling_vocab() -> set[str]:
     global _spelling_vocab_cache, _spelling_vocab_list_cache
     if _spelling_vocab_cache:
@@ -1441,11 +1485,19 @@ async def send_push_notification(req: PushNotificationRequest, api_key: str = De
 @app.post("/smart-search", response_model=SmartSearchResponse)
 async def smart_search(request: SmartSearchRequest):
     """AI-powered MAA Yojana package search with clinical reasoning."""
-    query_terms = _split_query_terms(request.query)
-    if request.procedure:
-        _append_unique_term(query_terms, request.procedure)
-    if request.disease:
-        _append_unique_term(query_terms, request.disease)
+    import asyncio
+    expanded_query, expanded_proc, expanded_dis = await asyncio.gather(
+        _expand_abbreviations_llm(request.query),
+        _expand_abbreviations_llm(request.procedure),
+        _expand_abbreviations_llm(request.disease)
+    )
+    
+    query_terms = _split_query_terms(expanded_query)
+    if expanded_proc:
+        _append_unique_term(query_terms, expanded_proc)
+    if expanded_dis:
+        _append_unique_term(query_terms, expanded_dis)
+        
     query_terms, spelling_corrections = _correct_query_terms_spelling(query_terms)
 
     main_term = query_terms[0] if query_terms else ""
@@ -1789,12 +1841,19 @@ async def start_interactive_search(request: InteractiveSearchStartRequest):
     """Start multi-step interactive package selection flow."""
     try:
         from tools.smart_search_flow import build_search_flow, _split_query_terms as flow_split, advance_past_empty_optional_steps
+        import asyncio
 
-        terms = flow_split(request.query)
-        if request.procedure:
-            terms.insert(0, request.procedure)
-        if request.disease and request.disease not in terms:
-            terms.append(request.disease)
+        expanded_query, expanded_proc, expanded_dis = await asyncio.gather(
+            _expand_abbreviations_llm(request.query),
+            _expand_abbreviations_llm(request.procedure),
+            _expand_abbreviations_llm(request.disease)
+        )
+
+        terms = flow_split(expanded_query)
+        if expanded_proc:
+            terms.insert(0, expanded_proc)
+        if expanded_dis and expanded_dis not in terms:
+            terms.append(expanded_dis)
         terms, corrections = _correct_query_terms_spelling(terms)
         if not terms:
             raise HTTPException(400, "Please provide a query, procedure, or disease")
