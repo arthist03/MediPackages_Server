@@ -107,6 +107,8 @@ CLINICAL_SEARCH_EXPANSIONS: dict[str, list[str]] = {
     "chest pain":       ["coronary", "angiography", "cardiac", "heart", "ptca", "cabg", "thrombolysis", "mi"],
     "heart attack":     ["mi", "myocardial", "thrombolysis", "ptca", "coronary", "stemi", "nstemi", "cabg"],
     "angioplasty":      ["ptca", "coronary", "stent", "cardiology", "pci"],
+    "cabg":             ["coronary artery bypass", "bypass", "grafting", "cabg", "cardiac", "cardiothoracic"],
+    "coronary artery bypass grafting": ["cabg", "bypass", "grafting", "coronary", "cardiothoracic"],
     "breathlessness":   ["heart failure", "cardiac", "pulmonary", "respiratory", "chf"],
     "rheumatic fever":  ["rheumatic fever", "valvular heart", "acute rheumatic"],
     "acute rheumatic fever": ["rheumatic fever", "valvular heart", "acute rheumatic"],
@@ -116,6 +118,7 @@ CLINICAL_SEARCH_EXPANSIONS: dict[str, list[str]] = {
     "appendix":         ["appendicitis", "appendicectomy", "appendicular"],
     "appendicitis":     ["appendix", "appendicectomy", "appendicular"],
     "cholecystectomy":  ["gallbladder", "cholecystitis", "laparoscopic"],
+    "colostomy":        ["colostomy", "stoma", "intestin", "colon"],
     "gastric":          ["gastric", "gastrectomy", "gastrojejunostomy", "ulcer", "stomach"],
     "hernia":           ["inguinal", "ventral", "umbilical", "hernia repair"],
     # Ophthalmology
@@ -144,12 +147,22 @@ CLINICAL_SEARCH_EXPANSIONS: dict[str, list[str]] = {
     "icu":              ["icu", "intensive", "care"],
     "blood":            ["transfusion", "blood", "component", "packed", "ffp", "platelet"],
     "blood transfusion":["transfusion", "platelet", "packed", "whole blood", "component"],
+    # Direct disease/condition terms
+    "sepsis":           ["sepsis", "septicemia", "septic", "infection", "icu"],
+    "anemia":           ["anemia", "anaemia", "transfusion", "blood"],
+    "anaemia":          ["anemia", "anaemia", "transfusion", "blood"],
 }
 
 # High-precision phrase → keyword boosters (exact match scoring)
 PHRASE_PRIORITY_KEYWORDS: dict[str, list[str]] = {
     "angioplasty":      ["ptca", "coronary angioplasty", "coronary", "angioplasty", "pci"],
     "ptca":             ["ptca"],
+    "cabg":             ["coronary artery bypass", "cabg", "bypass grafting"],
+    "coronary artery bypass grafting": ["coronary artery bypass", "cabg", "bypass grafting"],
+    "colostomy":        ["colostomy"],
+    "sepsis":           ["sepsis", "septicemia"],
+    "anemia":           ["anemia", "anaemia"],
+    "anaemia":          ["anemia", "anaemia"],
     "tbsa":             ["tbsa", "thermal", "electrical", "flame"],
     "tbsa burns":       ["tbsa", "thermal", "electrical", "flame"],
     "burn":             ["tbsa", "burns", "thermal", "flame", "chemical", "electrical"],
@@ -205,6 +218,7 @@ PROCEDURE_ALIASES: dict[str, str] = {
     "lap chole":       "laparoscopic cholecystectomy",
     "kidney transplant": "renal transplant",
     "liver tx":        "liver transplant",
+    "cabg":            "coronary artery bypass grafting",
 }
 
 
@@ -1836,82 +1850,81 @@ async def analyze_interactive_query(request: AnalyzeQueryRequest):
     if not _async_groq_client:
         raise HTTPException(500, "Groq client not initialised")
 
-    prompt = f"""You are a master clinician specialized in ALL medical fields AND an expert in PMJAY/Ayushman Bharat/MAA Yojana package naming conventions.
+    prompt = f"""You are a master clinician AND an expert in PMJAY/Ayushman Bharat/MAA Yojana package naming.
 
-YOUR JOB: Given an unstructured patient history, think step-by-step like a treating doctor:
- 1. What is the PRIMARY DIAGNOSIS?
- 2. What PROCEDURE(S) would I order for this patient?
- 3. Are there SUPPORTIVE CARE or ADD-ON packages this patient needs?
- 4. What COMORBIDITY packages apply?
+YOUR JOB: Analyze the user's input and produce the correct search keywords.
 
-Then produce keywords that EXACTLY match (or closely match) real package names from our database.
+═══ CRITICAL RULES (READ FIRST) ═══
 
-═══ PACKAGE NAME REFERENCE (use these exact terms as keywords) ═══
+RULE A — SIMPLE INPUT (1-3 words, direct terms like a procedure name, disease, diagnosis, or abbreviation):
+  → Just return that term as-is (or its full medical form if abbreviated).
+  → Do NOT invent related procedures or add-ons.
+  → Do NOT over-interpret. If user types "Anemia", keyword = ["Anemia"]. That's it.
+  → If user types "CABG", keyword = ["Coronary Artery Bypass Grafting"]. That's it.
+  → If user types "Colostomy", keyword = ["Colostomy"]. That's it.
+  → If user types "Sepsis, Anemia", keywords = ["Sepsis", "Anemia"]. That's it.
 
-CARDIOLOGY / VASCULAR:
-Peripheral Angioplasty - POBA, Angioplasty - POBA, Intravascular ultrasound (IVUS), PTCA, Coronary Angiography, Peripheral Angioplasty, Catheter directed Thrombolysis, Systemic Thrombolysis, Congestive heart failure, Atrial Fibrillation, Pacemaker Implantation, ASD Device Closure, VSD Device Closure, Electrophysiological Study, Aortic Aneurysm Repair, Aortic stenting, Thromboembolectomy, Management of Varicose Veins, Varicose vein endovenous treatment
+RULE B — COMMA-SEPARATED TERMS (user lists multiple procedures/diseases separated by commas):
+  → Each comma-separated term becomes its own keyword.
+  → Expand abbreviations to full medical terms. Do NOT merge or reinterpret.
+  → Example: "CABG, Blood Transfusion" → ["Coronary Artery Bypass Grafting", "Blood Transfusion"]
 
-GENERAL SURGERY:
-Appendicectomy, Cholecystectomy, Hernia, Exploratory Laparotomy, Operation for Gastric Perforation, Operation for Bleeding Peptic Ulcer, Pilonidal Sinus, Necrotising Fascitis, Abscess Tapping, Fistulectomy, Thyroidectomy, Splenectomy, Diverticulectomy
+RULE C — COMPLEX CLINICAL HISTORY (a sentence/paragraph describing patient history, symptoms, age, etc.):
+  → ONLY in this case, think like a treating doctor and generate clinical keywords.
+  → Expand abbreviations to their PMJAY package name equivalents.
+  → Include: PRIMARY procedure/diagnosis + SUPPORTIVE add-ons if clinically needed.
+  → Use exact package name fragments from the reference list below.
+  → Maximum 6 keywords.
 
-ORTHOPAEDICS:
-Total Hip Replacement, Total Knee Replacement, Fracture - Neck Femur, Fracture - Long Bones, Arthroscopic Meniscus Repair, Spine deformity correction, Lumbar Discectomy, Bone grafting for Non union, Tendon Repair, Limb Lengthening
+═══ HOW TO DECIDE SIMPLE vs COMPLEX ═══
+- SIMPLE: "CABG", "Anemia", "Colostomy", "Hernia", "PTCA", "Appendicectomy", "Sepsis, Anemia"
+- COMPLEX: "58yo male diabetic with chest pain and reduced EF", "Patient with oral cancer on chemo with weakness and bed sores"
+- If unsure, treat as SIMPLE.
 
-ONCOLOGY (SURGICAL / MEDICAL):
-CT for CA Head & Neck, CA Oral Head & Neck - Tab. CAPECITABINE, CA Oral Head & Neck - Tab. GEFITINIB + Methotrexate, CT for CA Breast, CT for CA Lung, CT for CA Cervix, CT for CA Ovary, CT for Colorectal Cancer, CT for Esophageal Cancer, Mastectomy, Breast conserving surgery, Wide Excision- Oral Cavity Malignancy, Neck dissection, Cytoreductive surgery, Bone tumors / soft tissue sarcomas: surgery, Wilms tumors: surgery, Radical Nephrectomy, Radical Prostatectomy, Radical Hysterectomy
+═══ COMMON ABBREVIATIONS (expand these) ═══
+CABG = Coronary Artery Bypass Grafting
+PTCA = Percutaneous Transluminal Coronary Angioplasty  
+TKR = Total Knee Replacement
+THR = Total Hip Replacement
+TURP = Transurethral Resection of Prostate
+TURBT = Transurethral Resection of Bladder Tumour
+LAP CHOLE = Laparoscopic Cholecystectomy
+ERCP = Endoscopic Retrograde Cholangiopancreatography
+D&C = Dilatation and Curettage
+ORIF = Open Reduction Internal Fixation
+LSCS = Lower Segment Caesarean Section
+MTP = Medical Termination of Pregnancy
+NPWT = Negative Pressure Wound Therapy
+ASD = Atrial Septal Defect
+VSD = Ventricular Septal Defect
+PDA = Patent Ductus Arteriosus
+COPD = Chronic Obstructive Pulmonary Disease
+DVT = Deep Vein Thrombosis
 
-REHABILITATION / PALLIATIVE:
-Comprehensive rehabilitation of post cancer disability, Medical/ neuro rehabilitation, Rehabilitation of post-cancer disability, NPWT, Conservative managment of pressure ulcer, Pressure ulcer management, Supportive care for long term patient, Feeding Jejunostomy, Silicon catheters, Geriatric care approach to managing pressure sore, Malignant Ascites drainage, Malignant Spinal Cord compression
+═══ PACKAGE NAME REFERENCE (for complex histories, use these exact terms) ═══
 
-NEUROLOGY / NEUROSURGERY:
-Acute Ischemic Stroke, Acute hemorrhagic stroke, Craniotomy, Epilepsy Surgery, Aneurysm Clipping, Brain Biopsy, Trans Sphenoidal Surgery, Shunt Surgery, VentriculoPerineal Shunt, Drug resistant epilepsy, Meningitis, Viral Encephalitis
+CARDIOLOGY: Coronary Artery Bypass Grafting, PTCA, Coronary Angiography, Peripheral Angioplasty - POBA, Pacemaker Implantation, ASD Device Closure, VSD Device Closure, Congestive heart failure, Atrial Fibrillation, Systemic Thrombolysis, Aortic Aneurysm Repair
+GENERAL SURGERY: Appendicectomy, Cholecystectomy, Hernia, Exploratory Laparotomy, Colostomy, Thyroidectomy, Splenectomy, Pilonidal Sinus, Fistulectomy, Necrotising Fascitis
+ORTHOPAEDICS: Total Hip Replacement, Total Knee Replacement, Fracture - Neck Femur, Fracture - Long Bones, Arthroscopic Meniscus Repair, Spine deformity correction, Lumbar Discectomy
+ONCOLOGY: CT for CA Head & Neck, CT for CA Breast, CT for CA Lung, CT for Colorectal Cancer, Mastectomy, Radical Nephrectomy, Radical Hysterectomy, Wide Excision- Oral Cavity Malignancy
+UROLOGY: TURP, TURBT, Nephrectomy, Nephrolithotomy, Ureteroscopy, Cystectomy, Urethroplasty
+NEUROSURGERY: Craniotomy, Acute Ischemic Stroke, Epilepsy Surgery, Shunt Surgery, Aneurysm Clipping
+BURNS: Thermal burns, Flame burns, Electrical contact burns, Chemical burns, Post Burn Contracture
+ENT: Tonsillectomy, Septoplasty, Tympanoplasty, Cochlear Implant
+OPHTHALMOLOGY: Cataract Surgery, Vitreoretinal Surgery, Glaucoma surgery
+GASTROENTEROLOGY: ERCP, Upper GI bleeding, Acute necrotizing severe pancreatitis, Liver abscess
+OBS/GYN: Hysterectomy, Caesarean Section, D&C, Medical Termination of Pregnancy
+SUPPORTIVE/ADD-ON: Blood Transfusion, ICU, Feeding Jejunostomy, NPWT, Supportive care for long term patient, Pressure ulcer management
 
-MENTAL HEALTH:
-Attention-Deficit/Hyperactivity Disorder (ADHD) in early Adolescence, Opioids drug dependence / alcohol dependence, Behavioral and emotional Disorders, Psychiatric counseling, Mood disorders, Neurotic stress-related disorders, Mental and Behavioural disorders due to psychoactive substance use
-
-BURNS:
-Thermal burns, Flame burns, Scald burns, Electrical contact burns, Chemical burns, Post Burn Contracture
-
-UROLOGY:
-TURP, TURBT, Nephrectomy, Nephrolithotomy, Ureteroscopy, Cystectomy, DJ stenting, Urethroplasty, Bladder injury repair, Orchiopexy
-
-OBSTETRICS & GYNECOLOGY:
-Hysterectomy, Abdominal Myomectomy, Caesarean Section, D&C, Laparoscopy for Ectopic, Medical Termination of Pregnancy, Vesico-vaginal fistula repair
-
-ENT:
-Tonsillectomy, Septoplasty, Mastoidectomy, Tympanoplasty, Microlaryngoscopic Surgery, Cochlear Implant
-
-OPHTHALMOLOGY:
-Cataract Surgery, Vitreoretinal Surgery, Corneal Grafting, Squint correction, Glaucoma surgery
-
-GASTROENTEROLOGY:
-ERCP, Endoscopic Variceal band ligation, Upper GI bleeding, Liver abscess, Acute liver failure, Acute necrotizing severe pancreatitis, Oesophageal stenting
-
-PULMONOLOGY:
-Bronchiectasis, Acute excaberation of COPD, Asthma, Pneumothorax, Decortication, Lobectomy
-
-PEDIATRICS:
-Intussusception, Hirschsprung's Disease, Congenital Heart Disease, Kawasaki Disease, Neonatal care, Febrile Neutopenia, Juvenile Arthritis
-
-═══ INSTRUCTIONS ═══
-
-1. Write a concise 1-2 sentence clinical summary.
-2. Generate 3-6 keywords that a doctor would actually search for to find ALL relevant packages for this patient. Think:
-   - PRIMARY CONDITION keyword (matches diagnosis packages)
-   - PROCEDURE keyword(s) (matches treatment/surgery packages)
-   - ADD-ON / SUPPORTIVE keyword (if patient needs feeding support, rehab, NPWT, etc.)
-   - COMORBIDITY keyword ONLY if it has its own treatment package
-3. USE EXACT package name fragments from the reference above when possible.
-4. For CANCER cases: include BOTH the surgical package keyword AND the chemotherapy regimen keyword (e.g., "CA Oral Head & Neck - Capecitabine").
-5. For ELDERLY/BEDRIDDEN patients: include geriatric/supportive packages like "supportive care for long term patient", "Feeding Jejunostomy", "pressure sore".
-6. TRANSLATE layman terms → medical package names (e.g., "leg artery blockage" → "Peripheral Angioplasty").
-7. Determine patient_type: "Adult" (age >= 18 or elderly/geriatric) or "Pediatric" (age < 18 or child/infant/neonatal).
-
-EXAMPLES:
-- "58yo diabetic with leg pain, reduced pulses, arterial narrowing" → keywords: ["Peripheral Angioplasty - POBA", "Angioplasty - POBA", "Intravascular ultrasound (IVUS)"]
-- "78yo bedridden with pressure ulcers, poor nutrition" → keywords: ["Pressure ulcer", "Debridement of Ulcer", "supportive care for long term patient", "Feeding Jejunostomy"]
-- "15yo hyperactive adolescent with substance use" → keywords: ["Attention-Deficit/Hyperactivity Disorder (ADHD) in early Adolescence", "Opioids drug dependence / alcohol dependence"]
-- "62yo oral cancer on chemo with weakness" → keywords: ["CA Oral Head & Neck - Capecitabine", "CA Oral Head & Neck - Gefitinib + Methotrexate", "Comprehensive rehabilitation of post cancer disability"]
+═══ EXAMPLES ═══
+Input: "CABG" → {{"summary": "Patient needs coronary artery bypass grafting.", "keywords": ["Coronary Artery Bypass Grafting"], "patient_type": "Adult"}}
+Input: "Colostomy" → {{"summary": "Patient needs colostomy procedure.", "keywords": ["Colostomy"], "patient_type": "Adult"}}
+Input: "Anemia" → {{"summary": "Patient has anemia.", "keywords": ["Anemia"], "patient_type": "Adult"}}
+Input: "Sepsis, Anemia" → {{"summary": "Patient has sepsis and anemia.", "keywords": ["Sepsis", "Anemia"], "patient_type": "Adult"}}
+Input: "PTCA" → {{"summary": "Patient needs percutaneous transluminal coronary angioplasty.", "keywords": ["PTCA"], "patient_type": "Adult"}}
+Input: "Hernia, Blood Transfusion" → {{"summary": "Patient needs hernia repair with blood transfusion support.", "keywords": ["Hernia", "Blood Transfusion"], "patient_type": "Adult"}}
+Input: "58yo diabetic with chest pain and reduced EF" → {{"summary": "Elderly diabetic male with acute coronary syndrome and heart failure.", "keywords": ["Coronary Angiography", "PTCA", "Coronary Artery Bypass Grafting", "Congestive heart failure"], "patient_type": "Adult"}}
+Input: "5yo child with intussusception" → {{"summary": "Pediatric patient with intussusception requiring surgical intervention.", "keywords": ["Intussusception"], "patient_type": "Pediatric"}}
 
 Input: "{request.query}"
 
