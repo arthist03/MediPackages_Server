@@ -763,20 +763,22 @@ Consider surgical vs conservative approach, select most appropriate treatment.""
 {base_rules}
 
 CRITICAL OUTPUT RULES:
-- Return ONLY exact, highly related packages. No broad categories.
-- Include 3-step clinical chain in doctor_summary: diagnosis → treatment → justification
+- Return ONLY exact, highly related packages. Give PRECISE, DEFINITIVE, and non-vague reasoning. Do not use broad categories.
+- Translate layman/simple terms (e.g. "kidney", "heart", "eye") to accurate medical terminology (e.g. "renal", "cardiac", "ophthalmic") before determining matches.
+- Include 3-step clinical chain in doctor_summary: layman term mapping → exact clinical diagnosis → treatment → justification.
+- ALWAYS proactively suggest 1-3 highly relevant clinical ADD-ON packages (e.g. blood transfusion, ICU, anaesthesia, biopsy, extended LOS, implants) in 'addons' if clinically appropriate and allowed by rules, even if not explicitly requested.
 - If blocked_rules has violations set approval_likelihood to "REJECTED"
 
 Return ONLY valid JSON:
 {{
     "main_package_code": "EXACT_CODE or null",
-    "main_package_reason": "Why this package fits",
+    "main_package_reason": "Provide precise medical justification why this package fits",
     "implant_code": "IMPLANT_CODE or null",
-    "addons": [{{"code": "CODE", "reason": "Medical justification"}}],
-    "alternative_codes": ["Max 2 alternatives"],
+    "addons": [{{"code": "CODE", "reason": "Specific medical justification for this add-on"}}],
+    "alternative_codes": ["Max 2 precise alternatives"],
     "blocked_rules": ["Any rule violations"],
     "approval_likelihood": "HIGH / MEDIUM / LOW / REJECTED",
-    "doctor_summary": "Clinical assessment with package code justification"
+    "doctor_summary": "Precise, step-by-step clinical assessment and terminology mapping without vague statements."
 }}"""
 
 
@@ -1839,6 +1841,7 @@ Given unstructured medical history, extract:
 1. Concise professional summary (1-2 sentences)
 2. 1-3 precise clinical keywords (procedures/diagnoses) for package search
 3. IMPORTANT RULES:
+   - TRANSLATE colloquial/simple layman terms to their EXACT medical equivalents (e.g. kidney → renal/nephrology, heart → cardiac, eye → ophthalmic/cataract, stomach → gastric). This is CRITICAL for accurate PMJAY package search.
    - EXPAND all medical abbreviations/short forms to their FULL form in the keywords
      Examples: CABG → Coronary Artery Bypass Grafting, TKR → Total Knee Replacement,
      PTCA → Percutaneous Transluminal Coronary Angioplasty, ASD → Atrial Septal Defect,
@@ -1846,7 +1849,7 @@ Given unstructured medical history, extract:
      AVR → Aortic Valve Replacement, ERCP → Endoscopic Retrograde Cholangiopancreatography,
      LSCS → Lower Segment Caesarean Section, ORIF → Open Reduction Internal Fixation
    - DEDUPLICATE: no synonyms, no acronym+full-name pairs, no symptom if procedure covers it
-   - Keywords must be the FULL expanded medical term, never an abbreviation
+   - Keywords must be the FULL expanded medical term in English, never an abbreviation or informal term.
 
 Input: "{request.query}"
 
