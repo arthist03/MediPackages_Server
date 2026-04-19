@@ -1836,20 +1836,21 @@ async def analyze_interactive_query(request: AnalyzeQueryRequest):
     if not _async_groq_client:
         raise HTTPException(500, "Groq client not initialised")
 
-    prompt = f"""You are an expert PMJAY medical AI.
-Given unstructured medical history, extract:
+    prompt = f"""You are an expert PMJAY/Ayushman Bharat medical AI.
+Given an unstructured medical history, extract a comprehensive set of clinical keywords to find exact medical packages.
+
 1. Concise professional summary (1-2 sentences)
-2. 1-3 precise clinical keywords (procedures/diagnoses) for package search
+2. Extract ALL highly relevant clinical keywords into a single list, ensuring you capture:
+   - Primary Diagnosis / Main Disease
+   - Likely Surgical Procedures or Medical Treatments required (e.g., Skin Grafting, Amputation, Chemotherapy)
+   - Important Comorbidities or Complications (e.g., Sepsis, Malnutrition, Diabetes Mellitus)
+   - Necessary Supportive Care / Add-ons (e.g., ICU Care, Blood Transfusion, Mechanical Ventilation)
 3. IMPORTANT RULES:
-   - TRANSLATE colloquial/simple layman terms to their EXACT medical equivalents (e.g. kidney → renal/nephrology, heart → cardiac, eye → ophthalmic/cataract, stomach → gastric). This is CRITICAL for accurate PMJAY package search.
-   - EXPAND all medical abbreviations/short forms to their FULL form in the keywords
-     Examples: CABG → Coronary Artery Bypass Grafting, TKR → Total Knee Replacement,
-     PTCA → Percutaneous Transluminal Coronary Angioplasty, ASD → Atrial Septal Defect,
-     TURP → Transurethral Resection of Prostate, MVR → Mitral Valve Replacement,
-     AVR → Aortic Valve Replacement, ERCP → Endoscopic Retrograde Cholangiopancreatography,
-     LSCS → Lower Segment Caesarean Section, ORIF → Open Reduction Internal Fixation
-   - DEDUPLICATE: no synonyms, no acronym+full-name pairs, no symptom if procedure covers it
-   - Keywords must be the FULL expanded medical term in English, never an abbreviation or informal term.
+   - PREDICT PROCEDURES: If the clinical history strongly implies a specific procedure or treatment (e.g., "limb ischemia + deep burns" -> Amputation/Debridement; "oral cancer + weakness" -> Chemotherapy/Radiotherapy/Supportive Care), include the procedure as a keyword!
+   - TRANSLATE colloquial/simple layman terms to EXACT medical equivalents (e.g. kidney → renal/nephrology, heart → cardiac, stomach → gastric). CRITICAL for PMJAY accuracy.
+   - EXPAND abbreviations (e.g. CABG → Coronary Artery Bypass Grafting, TKR → Total Knee Replacement).
+   - DEDUPLICATE: No synonyms, no acronym+full-name pairs.
+   - Do NOT artificially limit yourself to 1-3 keywords; provide as many as are clinically significant (typically 3-8 keywords).
 
 Input: "{request.query}"
 
