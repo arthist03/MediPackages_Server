@@ -1830,31 +1830,35 @@ def _sync_session_db(session_id: str, flow: Any, sels: list[dict], pt_type: str 
         logger.error("Failed to sync session: %s", e)
 
 
-@app.post("/interactive-search/analyze-query", response_model=AnalyzeQueryResponse)
+@app.post("/interactive-search/analyze-query")
 async def analyze_interactive_query(request: AnalyzeQueryRequest):
-    """NLP analysis of free-text patient history → clinical keywords."""
+    """NLP analysis of free-text patient history → clinical keywords + patient type."""
     if not _async_groq_client:
         raise HTTPException(500, "Groq client not initialised")
 
     prompt = f"""You are an expert PMJAY/Ayushman Bharat medical AI.
-Given an unstructured medical history, extract a comprehensive set of clinical keywords to find exact medical packages.
+Given an unstructured medical history, extract FOCUSED clinical keywords to find exact medical packages.
 
 1. Concise professional summary (1-2 sentences)
-2. Extract ALL highly relevant clinical keywords into a single list, ensuring you capture:
-   - Primary Diagnosis / Main Disease
-   - Likely Surgical Procedures or Medical Treatments required (e.g., Skin Grafting, Amputation, Chemotherapy)
-   - Important Comorbidities or Complications (e.g., Sepsis, Malnutrition, Diabetes Mellitus)
-   - Necessary Supportive Care / Add-ons (e.g., ICU Care, Blood Transfusion, Mechanical Ventilation)
-3. IMPORTANT RULES:
-   - PREDICT PROCEDURES: If the clinical history strongly implies a specific procedure or treatment (e.g., "limb ischemia + deep burns" -> Amputation/Debridement; "oral cancer + weakness" -> Chemotherapy/Radiotherapy/Supportive Care), include the procedure as a keyword!
-   - TRANSLATE colloquial/simple layman terms to EXACT medical equivalents (e.g. kidney → renal/nephrology, heart → cardiac, stomach → gastric). CRITICAL for PMJAY accuracy.
+2. Extract ONLY the most critical clinical keywords (MAXIMUM 2-4 keywords). Focus on:
+   - Primary Diagnosis / Main Disease (1 keyword)
+   - Most likely required Procedure or Treatment (1 keyword)
+   - ONE critical comorbidity ONLY if it directly changes the treatment package (optional)
+   - ONE essential supportive care ONLY if explicitly mentioned or critically required (optional)
+3. Determine patient_type: "Adult" or "Pediatric" based on the patient description.
+4. IMPORTANT RULES:
+   - STRICT LIMIT: Return AT MOST 4 keywords. Prefer 2-3. Quality over quantity!
+   - DO NOT include generic supportive terms like "nutritional support", "long-term supportive care", "immobility" — these are NOT searchable PMJAY packages.
+   - DO NOT include both a disease AND its obvious symptom (e.g., don't include both "Pressure ulcer" and "Skin grafting" if skin grafting is the treatment for the ulcer — just include "Pressure ulcer" and "Debridement" or the primary procedure).
+   - PREDICT the SINGLE most relevant procedure, not multiple possible procedures.
+   - TRANSLATE colloquial/simple layman terms to EXACT medical equivalents (e.g. kidney → renal, heart → cardiac, stomach → gastric).
    - EXPAND abbreviations (e.g. CABG → Coronary Artery Bypass Grafting, TKR → Total Knee Replacement).
    - DEDUPLICATE: No synonyms, no acronym+full-name pairs.
-   - Do NOT artificially limit yourself to 1-3 keywords; provide as many as are clinically significant (typically 3-8 keywords).
+   - PATIENT TYPE: If age >= 18 or words like "adult", "elderly", "geriatric", "old" appear → "Adult". If age < 18 or words like "child", "pediatric", "paediatric", "infant", "neonatal", "newborn", "toddler", "juvenile", "baby" appear → "Pediatric". Default to "Adult" if unclear.
 
 Input: "{request.query}"
 
-Return ONLY JSON: {{"summary": "...", "keywords": ["..."]}}"""
+Return ONLY JSON: {{"summary": "...", "keywords": ["..."], "patient_type": "Adult" or "Pediatric"}}"""
 
     try:
         resp = await _async_groq_client.chat.completions.create(
@@ -1863,13 +1867,54 @@ Return ONLY JSON: {{"summary": "...", "keywords": ["..."]}}"""
             temperature=0.0, response_format={"type": "json_object"},
         )
         parsed = json.loads(resp.choices[0].message.content)
-        return AnalyzeQueryResponse(
-            summary=parsed.get("summary", "No summary."),
-            keywords=parsed.get("keywords") or [request.query[:50]],
-        )
+
+        keywords = parsed.get("keywords") or [request.query[:50]]
+        # Hard cap at 4 keywords even if LLM returns more
+        if len(keywords) > 4:
+            keywords = keywords[:4]
+
+        # Determine patient type from AI response + fallback heuristic
+        ai_patient_type = parsed.get("patient_type", "").strip()
+        if ai_patient_type not in ("Adult", "Pediatric"):
+            ai_patient_type = _detect_patient_type_from_text(request.query)
+
+        return JSONResponse(content={
+            "summary": parsed.get("summary", "No summary."),
+            "keywords": keywords,
+            "patient_type": ai_patient_type,
+        })
     except Exception as e:
         logger.error("Query analysis failed: %s", e)
-        return AnalyzeQueryResponse(summary=f"Analysis failed. Original: {request.query}", keywords=[request.query])
+        detected_pt = _detect_patient_type_from_text(request.query)
+        return JSONResponse(content={
+            "summary": f"Analysis failed. Original: {request.query}",
+            "keywords": [request.query],
+            "patient_type": detected_pt,
+        })
+
+
+def _detect_patient_type_from_text(text: str) -> str:
+    """Heuristic fallback to detect Adult vs Pediatric from free text."""
+    t = (text or "").lower()
+
+    # Check for explicit pediatric mentions
+    pedia_words = ["pediatric", "paediatric", "child", "infant", "neonatal",
+                   "neonate", "newborn", "toddler", "juvenile", "baby"]
+    if any(w in t for w in pedia_words):
+        return "Pediatric"
+
+    # Check for age mentions
+    age_match = re.search(r'(\d{1,3})\s*[-–]?\s*(?:year|yr|y/?o|yrs)', t)
+    if age_match:
+        age = int(age_match.group(1))
+        return "Pediatric" if age < 18 else "Adult"
+
+    # Check for explicit adult mentions
+    adult_words = ["adult", "elderly", "geriatric"]
+    if any(w in t for w in adult_words):
+        return "Adult"
+
+    return "Adult"  # Default
 
 
 @app.post("/interactive-search/start", response_model=InteractiveSearchStartResponse)
