@@ -1836,29 +1836,86 @@ async def analyze_interactive_query(request: AnalyzeQueryRequest):
     if not _async_groq_client:
         raise HTTPException(500, "Groq client not initialised")
 
-    prompt = f"""You are an expert PMJAY/Ayushman Bharat medical AI.
-Given an unstructured medical history, extract FOCUSED clinical keywords to find exact medical packages.
+    prompt = f"""You are a master clinician specialized in ALL medical fields AND an expert in PMJAY/Ayushman Bharat/MAA Yojana package naming conventions.
 
-1. Concise professional summary (1-2 sentences)
-2. Extract ONLY the most critical clinical keywords (MAXIMUM 2-4 keywords). Focus on:
-   - Primary Diagnosis / Main Disease (1 keyword)
-   - Most likely required Procedure or Treatment (1 keyword)
-   - ONE critical comorbidity ONLY if it directly changes the treatment package (optional)
-   - ONE essential supportive care ONLY if explicitly mentioned or critically required (optional)
-3. Determine patient_type: "Adult" or "Pediatric" based on the patient description.
-4. IMPORTANT RULES:
-   - STRICT LIMIT: Return AT MOST 4 keywords. Prefer 2-3. Quality over quantity!
-   - DO NOT include generic supportive terms like "nutritional support", "long-term supportive care", "immobility" — these are NOT searchable PMJAY packages.
-   - DO NOT include both a disease AND its obvious symptom (e.g., don't include both "Pressure ulcer" and "Skin grafting" if skin grafting is the treatment for the ulcer — just include "Pressure ulcer" and "Debridement" or the primary procedure).
-   - PREDICT the SINGLE most relevant procedure, not multiple possible procedures.
-   - TRANSLATE colloquial/simple layman terms to EXACT medical equivalents (e.g. kidney → renal, heart → cardiac, stomach → gastric).
-   - EXPAND abbreviations (e.g. CABG → Coronary Artery Bypass Grafting, TKR → Total Knee Replacement).
-   - DEDUPLICATE: No synonyms, no acronym+full-name pairs.
-   - PATIENT TYPE: If age >= 18 or words like "adult", "elderly", "geriatric", "old" appear → "Adult". If age < 18 or words like "child", "pediatric", "paediatric", "infant", "neonatal", "newborn", "toddler", "juvenile", "baby" appear → "Pediatric". Default to "Adult" if unclear.
+YOUR JOB: Given an unstructured patient history, think step-by-step like a treating doctor:
+ 1. What is the PRIMARY DIAGNOSIS?
+ 2. What PROCEDURE(S) would I order for this patient?
+ 3. Are there SUPPORTIVE CARE or ADD-ON packages this patient needs?
+ 4. What COMORBIDITY packages apply?
+
+Then produce keywords that EXACTLY match (or closely match) real package names from our database.
+
+═══ PACKAGE NAME REFERENCE (use these exact terms as keywords) ═══
+
+CARDIOLOGY / VASCULAR:
+Peripheral Angioplasty - POBA, Angioplasty - POBA, Intravascular ultrasound (IVUS), PTCA, Coronary Angiography, Peripheral Angioplasty, Catheter directed Thrombolysis, Systemic Thrombolysis, Congestive heart failure, Atrial Fibrillation, Pacemaker Implantation, ASD Device Closure, VSD Device Closure, Electrophysiological Study, Aortic Aneurysm Repair, Aortic stenting, Thromboembolectomy, Management of Varicose Veins, Varicose vein endovenous treatment
+
+GENERAL SURGERY:
+Appendicectomy, Cholecystectomy, Hernia, Exploratory Laparotomy, Operation for Gastric Perforation, Operation for Bleeding Peptic Ulcer, Pilonidal Sinus, Necrotising Fascitis, Abscess Tapping, Fistulectomy, Thyroidectomy, Splenectomy, Diverticulectomy
+
+ORTHOPAEDICS:
+Total Hip Replacement, Total Knee Replacement, Fracture - Neck Femur, Fracture - Long Bones, Arthroscopic Meniscus Repair, Spine deformity correction, Lumbar Discectomy, Bone grafting for Non union, Tendon Repair, Limb Lengthening
+
+ONCOLOGY (SURGICAL / MEDICAL):
+CT for CA Head & Neck, CA Oral Head & Neck - Tab. CAPECITABINE, CA Oral Head & Neck - Tab. GEFITINIB + Methotrexate, CT for CA Breast, CT for CA Lung, CT for CA Cervix, CT for CA Ovary, CT for Colorectal Cancer, CT for Esophageal Cancer, Mastectomy, Breast conserving surgery, Wide Excision- Oral Cavity Malignancy, Neck dissection, Cytoreductive surgery, Bone tumors / soft tissue sarcomas: surgery, Wilms tumors: surgery, Radical Nephrectomy, Radical Prostatectomy, Radical Hysterectomy
+
+REHABILITATION / PALLIATIVE:
+Comprehensive rehabilitation of post cancer disability, Medical/ neuro rehabilitation, Rehabilitation of post-cancer disability, NPWT, Conservative managment of pressure ulcer, Pressure ulcer management, Supportive care for long term patient, Feeding Jejunostomy, Silicon catheters, Geriatric care approach to managing pressure sore, Malignant Ascites drainage, Malignant Spinal Cord compression
+
+NEUROLOGY / NEUROSURGERY:
+Acute Ischemic Stroke, Acute hemorrhagic stroke, Craniotomy, Epilepsy Surgery, Aneurysm Clipping, Brain Biopsy, Trans Sphenoidal Surgery, Shunt Surgery, VentriculoPerineal Shunt, Drug resistant epilepsy, Meningitis, Viral Encephalitis
+
+MENTAL HEALTH:
+Attention-Deficit/Hyperactivity Disorder (ADHD) in early Adolescence, Opioids drug dependence / alcohol dependence, Behavioral and emotional Disorders, Psychiatric counseling, Mood disorders, Neurotic stress-related disorders, Mental and Behavioural disorders due to psychoactive substance use
+
+BURNS:
+Thermal burns, Flame burns, Scald burns, Electrical contact burns, Chemical burns, Post Burn Contracture
+
+UROLOGY:
+TURP, TURBT, Nephrectomy, Nephrolithotomy, Ureteroscopy, Cystectomy, DJ stenting, Urethroplasty, Bladder injury repair, Orchiopexy
+
+OBSTETRICS & GYNECOLOGY:
+Hysterectomy, Abdominal Myomectomy, Caesarean Section, D&C, Laparoscopy for Ectopic, Medical Termination of Pregnancy, Vesico-vaginal fistula repair
+
+ENT:
+Tonsillectomy, Septoplasty, Mastoidectomy, Tympanoplasty, Microlaryngoscopic Surgery, Cochlear Implant
+
+OPHTHALMOLOGY:
+Cataract Surgery, Vitreoretinal Surgery, Corneal Grafting, Squint correction, Glaucoma surgery
+
+GASTROENTEROLOGY:
+ERCP, Endoscopic Variceal band ligation, Upper GI bleeding, Liver abscess, Acute liver failure, Acute necrotizing severe pancreatitis, Oesophageal stenting
+
+PULMONOLOGY:
+Bronchiectasis, Acute excaberation of COPD, Asthma, Pneumothorax, Decortication, Lobectomy
+
+PEDIATRICS:
+Intussusception, Hirschsprung's Disease, Congenital Heart Disease, Kawasaki Disease, Neonatal care, Febrile Neutopenia, Juvenile Arthritis
+
+═══ INSTRUCTIONS ═══
+
+1. Write a concise 1-2 sentence clinical summary.
+2. Generate 3-6 keywords that a doctor would actually search for to find ALL relevant packages for this patient. Think:
+   - PRIMARY CONDITION keyword (matches diagnosis packages)
+   - PROCEDURE keyword(s) (matches treatment/surgery packages)
+   - ADD-ON / SUPPORTIVE keyword (if patient needs feeding support, rehab, NPWT, etc.)
+   - COMORBIDITY keyword ONLY if it has its own treatment package
+3. USE EXACT package name fragments from the reference above when possible.
+4. For CANCER cases: include BOTH the surgical package keyword AND the chemotherapy regimen keyword (e.g., "CA Oral Head & Neck - Capecitabine").
+5. For ELDERLY/BEDRIDDEN patients: include geriatric/supportive packages like "supportive care for long term patient", "Feeding Jejunostomy", "pressure sore".
+6. TRANSLATE layman terms → medical package names (e.g., "leg artery blockage" → "Peripheral Angioplasty").
+7. Determine patient_type: "Adult" (age >= 18 or elderly/geriatric) or "Pediatric" (age < 18 or child/infant/neonatal).
+
+EXAMPLES:
+- "58yo diabetic with leg pain, reduced pulses, arterial narrowing" → keywords: ["Peripheral Angioplasty - POBA", "Angioplasty - POBA", "Intravascular ultrasound (IVUS)"]
+- "78yo bedridden with pressure ulcers, poor nutrition" → keywords: ["Pressure ulcer", "Debridement of Ulcer", "supportive care for long term patient", "Feeding Jejunostomy"]
+- "15yo hyperactive adolescent with substance use" → keywords: ["Attention-Deficit/Hyperactivity Disorder (ADHD) in early Adolescence", "Opioids drug dependence / alcohol dependence"]
+- "62yo oral cancer on chemo with weakness" → keywords: ["CA Oral Head & Neck - Capecitabine", "CA Oral Head & Neck - Gefitinib + Methotrexate", "Comprehensive rehabilitation of post cancer disability"]
 
 Input: "{request.query}"
 
-Return ONLY JSON: {{"summary": "...", "keywords": ["..."], "patient_type": "Adult" or "Pediatric"}}"""
+Return ONLY valid JSON: {{"summary": "...", "keywords": ["..."], "patient_type": "Adult" or "Pediatric"}}"""
 
     try:
         resp = await _async_groq_client.chat.completions.create(
@@ -1869,9 +1926,9 @@ Return ONLY JSON: {{"summary": "...", "keywords": ["..."], "patient_type": "Adul
         parsed = json.loads(resp.choices[0].message.content)
 
         keywords = parsed.get("keywords") or [request.query[:50]]
-        # Hard cap at 4 keywords even if LLM returns more
-        if len(keywords) > 4:
-            keywords = keywords[:4]
+        # Hard cap at 6 keywords (doctor-driven: diagnosis + procedures + supportive)
+        if len(keywords) > 6:
+            keywords = keywords[:6]
 
         # Determine patient type from AI response + fallback heuristic
         ai_patient_type = parsed.get("patient_type", "").strip()
