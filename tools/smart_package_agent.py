@@ -168,11 +168,11 @@ def _load_all_packages() -> tuple[list[dict], list[dict]]:
     maa_packages = []
     robotic_packages = []
     if PACKAGES_JSON.exists():
-        with open(PACKAGES_JSON, encoding="utf-8") as f:
+        with open(PACKAGES_JSON, encoding="utf-8-sig") as f:
             maa_packages = json.load(f)
         logger.info(f"Loaded {len(maa_packages)} MAA packages")
     if ROBOTIC_JSON.exists():
-        with open(ROBOTIC_JSON, encoding="utf-8") as f:
+        with open(ROBOTIC_JSON, encoding="utf-8-sig") as f:
             robotic_packages = json.load(f)
         logger.info(f"Loaded {len(robotic_packages)} robotic surgery packages")
 
@@ -407,9 +407,9 @@ def _score_package_intelligent(
     # This dynamically scales to ANY input, boosting exact multi-word clinical phrases 
     # (e.g. "limb loss", "conservative management", "extended los", "fibula graft")
     input_words = []
-    for field in ["diagnosis", "surgery_name", "procedure_name", "department"] + context.get("search_terms", []) + context.get("secondary_diagnoses", []):
-        if field:
-            input_words.extend(_normalize(str(field)).split())
+    for val in [context.get("diagnosis"), context.get("surgery_name"), context.get("procedure_name"), context.get("department")] + context.get("search_terms", []) + context.get("secondary_diagnoses", []):
+        if val:
+            input_words.extend(_normalize(str(val)).split())
             
     # Clean stop words but preserve important qualifiers like 'with', 'without', 'for'
     input_words = [w for w in input_words if len(w) > 1 and w not in {"the", "and", "is", "of", "to", "in", "a", "an"}]
