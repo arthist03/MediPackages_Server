@@ -123,9 +123,18 @@ def _find_linked_implants(
 
 
 # ── Scoring ───────────────────────────────────────────────────────────
+STOP_WORDS = {
+    "and", "are", "for", "from", "has", "have", "into", "not", "that", "the",
+    "their", "then", "there", "these", "they", "this", "was", "will", "with",
+    "patient", "year", "old", "male", "female", "she", "brought", "presents",
+    "history", "diagnosed", "had", "been", "done", "reports", "notes", "copy",
+    "number", "detailed", "summary", "treatment", "procedure", "all", "any"
+}
+
 def _tokenize(text: str) -> set[str]:
-    """Lowercase word tokenizer, strips short tokens."""
-    return set(re.findall(r"[a-z]{3,}", text.lower()))
+    """Lowercase word tokenizer, strips short tokens and stop words."""
+    tokens = set(re.findall(r"[a-z]{3,}", text.lower()))
+    return tokens - STOP_WORDS
 
 
 def _score_package(pkg: dict[str, Any], query_tokens: set[str]) -> float:

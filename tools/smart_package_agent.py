@@ -142,6 +142,16 @@ _SURGICAL_RE = re.compile(
 # Pre-normalized medical management set
 _MEDICAL_SET = {kw.lower() for kw in MEDICAL_MANAGEMENT_KEYWORDS}
 
+STOP_WORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "if", "in", 
+    "into", "is", "it", "no", "not", "of", "on", "or", "such", "that", "the", 
+    "their", "then", "there", "these", "they", "this", "to", "was", "will", "with",
+    "patient", "year", "old", "male", "female", "she", "he", "brought", "er", "with",
+    "severe", "acute", "presents", "history", "diagnosed", "from", "has", "have", "had", "been",
+    "done", "reports", "notes", "copy", "number", "detailed", "summary", "treatment", "procedure",
+    "all", "any", "other", "part", "showing", "investigations"
+}
+
 # Ultra-fast normalization helper
 def _normalize(text: str) -> str:
     if not text:
@@ -347,14 +357,21 @@ def _score_package_intelligent(
     for term in context["search_terms"]:
         if not term or len(term) <= 2:
             continue
-        term_set = set(term.split())
+        term_set = set(term.split()) - STOP_WORDS
+        if not term_set:
+            continue
+            
         if term == norm_name:
             score += 150
             reasons.append(f"Exact package name match: {term}")
-        elif term_set & pkg_words:
-            score += 80
-            reasons.append(f"Exact word match: {term}")
-        elif term in norm_name:
+        else:
+            overlap = term_set & pkg_words
+            if overlap:
+                match_ratio = len(overlap) / len(term_set)
+                score += 80 * match_ratio
+                reasons.append(f"Keyword match: {', '.join(overlap)}")
+
+        if term in norm_name:
             score += 35
             reasons.append(f"Term match: {term}")
 
