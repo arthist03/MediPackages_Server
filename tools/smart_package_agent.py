@@ -401,36 +401,50 @@ def _score_package_intelligent(
         score += 35
         reasons.append(f"Department match: {dept_n}")
 
-    # ── HIGH-PRECISION CLINICAL SMART BOOSTS (Improves accuracy by 10x) ──
-    # 1. Robotic Surgery Rule
-    is_robotic_query = any("robotic" in str(t).lower() for t in context["search_terms"] + [context["diagnosis"], context["surgery_name"], context["procedure_name"]])
-    is_robotic_package = source == "robotic" or "robotic" in norm_name
-    
-    if is_robotic_query:
-        if is_robotic_package:
-            score += 1000  # Massive boost for explicitly requested robotic
-            reasons.append("Explicit robotic match")
-        else:
-            score -= 100   # Penalize non-robotic if robotic requested
-    elif is_robotic_package:
-        score -= 200       # Strongly penalize robotic if not explicitly requested
-        
-    # 2. Medical Oncology (Chemotherapy) vs Surgical Oncology (Excision) Rule
-    is_chemo_query = any(kw in " ".join([_normalize(t) for t in context["search_terms"]]) for kw in ["chemotherapy", "tab", "cap", "oral chemo"])
-    if is_chemo_query:
-        if "chemo" in norm_name or "tab." in norm_name or "medical oncology" in norm_speciality:
-            score += 800
-            reasons.append("Medical Oncology / Chemo match")
-        elif "excision" in norm_name or "resection" in norm_name or "surgery" in norm_speciality:
-            score -= 300   # Penalize surgical if chemo requested
+    # ── UNIVERSAL DYNAMIC SMART SCORING ──
 
-    # 3. Exact Phrase Multi-Word Matching (Reconstruction, Grafts, Anatomical sites)
-    full_text = " ".join([_normalize(t) for t in context["search_terms"] if t])
-    important_phrases = ["fibula graft", "maxillary defect", "reconstruction", "squamous cell carcinoma", "oral cavity", "head & neck", "head and neck", "capecitabine"]
-    for phrase in important_phrases:
-        if phrase in full_text and phrase in norm_name:
-            score += 500
-            reasons.append(f"Exact critical phrase match: {phrase}")
+    # 3. Generalized Dynamic Phrase Matching (N-Grams)
+    # This dynamically scales to ANY input, boosting exact multi-word clinical phrases 
+    # (e.g. "limb loss", "conservative management", "extended los", "fibula graft")
+    input_words = []
+    for field in ["diagnosis", "surgery_name", "procedure_name", "department"] + context.get("search_terms", []) + context.get("secondary_diagnoses", []):
+        if field:
+            input_words.extend(_normalize(str(field)).split())
+            
+    # Clean stop words but preserve important qualifiers like 'with', 'without', 'for'
+    input_words = [w for w in input_words if len(w) > 1 and w not in {"the", "and", "is", "of", "to", "in", "a", "an"}]
+    
+    # N-gram overlap (boosts contiguous word matches exponentially)
+    for n in range(5, 1, -1): # Check 5-grams down to 2-grams
+        for i in range(len(input_words) - n + 1):
+            ngram = " ".join(input_words[i:i+n])
+            if len(ngram) > 6 and ngram in norm_name:
+                boost = (100 * n) + (len(ngram) * 10)
+                score += boost
+                reasons.append(f"{n}-word phrase match: '{ngram}'")
+                
+    # 4. Generalized Numeric / Range Constraint Matching
+    # (Crucial for TBSA percentages, sizes, ages, etc.)
+    import re
+    input_numbers = set(re.findall(r'\b\d+\b', " ".join(input_words)))
+    pkg_numbers = set(re.findall(r'\b\d+\b', norm_name))
+    
+    if pkg_numbers:
+        intersect = input_numbers.intersection(pkg_numbers)
+        if intersect:
+            score += 800 * len(intersect)
+            reasons.append(f"Numeric exact match: {intersect}")
+        elif input_numbers:
+            # If the package specifies a number (like 40% TBSA) but the input has a DIFFERENT number (like 65%),
+            # penalize it to prevent wrong numeric categorizations.
+            score -= 300
+            
+    # 5. Modifier Penalty System
+    # If the package specifically says "without", but the user didn't mention it (or mentioned "with")
+    if "without" in norm_name and "without" not in " ".join(input_words):
+        score -= 200
+    if "stand alone" in norm_name and "stand alone" not in " ".join(input_words) and "conservative" not in " ".join(input_words):
+        score -= 150
 
 
     # Surgical bonus
