@@ -170,11 +170,30 @@ def _load_all_packages() -> tuple[list[dict], list[dict]]:
     for pkg in maa_packages:
         pkg["_norm_name"] = _normalize(pkg.get("PACKAGE NAME", ""))
         pkg["_norm_speciality"] = _normalize(pkg.get("SPECIALITY", ""))
-        pkg["_words"] = set(pkg["_norm_name"].split())
+        
+        searchable_text = " ".join([
+            pkg.get("PACKAGE NAME", ""),
+            pkg.get("SPECIALITY", ""),
+            pkg.get("PRE AUTH DOCUMENT", ""),
+            pkg.get("CLAIM DOCUMENT", ""),
+            pkg.get("PACKAGE CATEGORY", ""),
+            pkg.get("Procedure Sub Category", ""),
+        ])
+        pkg["_words"] = set(_normalize(searchable_text).split())
+
     for pkg in robotic_packages:
         pkg["_norm_name"] = _normalize(pkg.get("Package Name", ""))
         pkg["_norm_speciality"] = _normalize(pkg.get("Speciality", ""))
-        pkg["_words"] = set(pkg["_norm_name"].split())
+        
+        searchable_text = " ".join([
+            pkg.get("Package Name", ""),
+            pkg.get("Speciality", ""),
+            pkg.get("PACKAGE TYPE", ""),
+            pkg.get("Procedure Type", ""),
+            pkg.get("Mandatory Documents", ""),
+            pkg.get("Mandatory Documents - Claim Processing", ""),
+        ])
+        pkg["_words"] = set(_normalize(searchable_text).split())
 
     return maa_packages, robotic_packages
 

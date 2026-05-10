@@ -131,12 +131,14 @@ def _tokenize(text: str) -> set[str]:
 def _score_package(pkg: dict[str, Any], query_tokens: set[str]) -> float:
     """Score a package against query tokens (weighted fields)."""
     searchable = " ".join([
-        pkg.get("PACKAGE NAME", pkg.get("Package Name", "")) * 3,
-        pkg.get("SPECIALITY", pkg.get("Speciality", "")) * 2,
+        pkg.get("PACKAGE NAME", pkg.get("Package Name", "")),
+        pkg.get("SPECIALITY", pkg.get("Speciality", "")),
         pkg.get("PRE AUTH DOCUMENT", ""),
         pkg.get("CLAIM DOCUMENT", ""),
-        pkg.get("PACKAGE CATEGORY", ""),
-        pkg.get("Procedure Sub Category", ""),
+        pkg.get("Mandatory Documents", ""),
+        pkg.get("Mandatory Documents - Claim Processing", ""),
+        pkg.get("PACKAGE CATEGORY", pkg.get("PACKAGE TYPE", "")),
+        pkg.get("Procedure Sub Category", pkg.get("Procedure Type", "")),
     ])
     pkg_tokens = _tokenize(searchable)
     if not pkg_tokens:
