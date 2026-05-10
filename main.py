@@ -1948,9 +1948,42 @@ Return ONLY valid JSON: {{"summary": "...", "keywords": ["..."], "patient_type":
         if ai_patient_type not in ("Adult", "Pediatric"):
             ai_patient_type = _detect_patient_type_from_text(request.query)
 
+        # ── MAP TO EXACT PACKAGE NAMES FROM ASSETS ──
+        # The user specifically wants the 'keywords' array to contain the EXACT
+        # package names from the JSON assets, not just generic LLM outputs.
+        # We will use the ultra-smart package agent to find the exact matches!
+        from tools.smart_package_agent import intelligent_package_search
+        
+        search_data = {
+            "diagnosis": request.query,
+            "search_terms": keywords,
+            "department": "",
+            "surgery_name": "",
+            "procedure_name": "",
+            "chief_complaints": [],
+            "secondary_diagnoses": [],
+            "surgery_required": True,
+            "procedure_required": True
+        }
+        
+        # Run the smart matching engine without the LLM override step to be fast
+        smart_results = intelligent_package_search(search_data, use_llm=False, top_k=5)
+        
+        exact_package_names = []
+        for pkg in smart_results.get("primary_packages", []) + smart_results.get("addon_packages", []) + smart_results.get("implant_packages", []):
+            name = pkg.get("package_name", pkg.get("PACKAGE NAME", ""))
+            if name and name not in exact_package_names:
+                exact_package_names.append(name.replace("\n", " ").strip())
+                
+        # If we found exact packages, use them as the keywords!
+        if exact_package_names:
+            final_keywords = exact_package_names[:6]
+        else:
+            final_keywords = keywords
+
         return JSONResponse(content={
             "summary": parsed.get("summary", "No summary."),
-            "keywords": keywords,
+            "keywords": final_keywords,
             "patient_type": ai_patient_type,
         })
     except Exception as e:
