@@ -1971,9 +1971,12 @@ Return ONLY valid JSON: {{"summary": "...", "keywords": ["..."], "patient_type":
         
         exact_package_names = []
         for pkg in smart_results.get("primary_packages", []) + smart_results.get("addon_packages", []) + smart_results.get("implant_packages", []):
-            name = pkg.get("package_name", pkg.get("PACKAGE NAME", ""))
-            if name and name not in exact_package_names:
-                exact_package_names.append(name.replace("\n", " ").strip())
+            full_name = pkg.get("package_name", pkg.get("PACKAGE NAME", ""))
+            if full_name:
+                # Extract just the short package name (everything before the first '|')
+                short_name = full_name.split("|")[0].replace("\n", " ").strip()
+                if short_name and short_name not in exact_package_names:
+                    exact_package_names.append(short_name)
                 
         # If we found exact packages, use them as the keywords!
         if exact_package_names:
