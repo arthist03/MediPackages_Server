@@ -1938,7 +1938,7 @@ Return ONLY valid JSON: {{"summary": "...", "keywords": ["..."], "patient_type":
         )
         parsed = json.loads(resp.choices[0].message.content)
 
-        keywords = parsed.get("keywords") or [request.query[:50]]
+        keywords = parsed.get("keywords") or [request.query]
         # Hard cap at 6 keywords (doctor-driven: diagnosis + procedures + supportive)
         if len(keywords) > 6:
             keywords = keywords[:6]
