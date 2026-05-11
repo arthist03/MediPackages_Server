@@ -1850,13 +1850,15 @@ async def analyze_interactive_query(request: AnalyzeQueryRequest):
     if not _async_groq_client:
         raise HTTPException(500, "Groq client not initialised")
 
-    prompt = f"""You are a PMJAY/MAA Yojana package keyword extractor.
+    prompt = f"""You are a PMJAY/MAA Yojana package keyword extractor. Think like a treating doctor.
 
-TASK: Convert user input into ONLY medical keywords. NO summaries. NO sentences. NO explanations.
+TASK: Convert user input into EXACT medical package name keywords. NO summaries. NO sentences. NO explanations. ONLY keywords.
+
+CRITICAL: NEVER return the user's input as-is. ALWAYS translate to medical/package terminology.
 
 RULES:
-1. SIMPLE INPUT (1-3 words like procedure/disease/abbreviation):
-   → Return as-is or expand abbreviation. Nothing else.
+1. DIRECT PROCEDURE/DISEASE NAME (already a medical term):
+   → Return as-is or expand abbreviation.
    → "CABG" → ["Coronary Artery Bypass Grafting"]
    → "Anemia" → ["Anemia"]
    → "Colostomy" → ["Colostomy"]
@@ -1864,14 +1866,52 @@ RULES:
 2. COMMA-SEPARATED: Each term = one keyword. Expand abbreviations.
    → "CABG, Blood Transfusion" → ["Coronary Artery Bypass Grafting", "Blood Transfusion"]
 
-3. COMPLEX HISTORY (sentence/paragraph): Extract clinical keywords only. Max 6.
-   → "58yo diabetic with chest pain" → ["Coronary Angiography", "PTCA", "Congestive heart failure"]
+3. LAYMAN/CLINICAL DESCRIPTION (any sentence, symptom, or common language):
+   → ALWAYS convert to the correct medical procedure/diagnosis package names.
+   → Think: What would a doctor diagnose? What packages would be booked?
+   → Max 6 keywords.
+
+LAYMAN TERM → PACKAGE NAME MAP (MUST USE):
+heart attack / MI → Coronary Angiography, PTCA, Coronary Artery Bypass Grafting, Systemic Thrombolysis
+chest pain → Coronary Angiography, PTCA
+kidney stone → Nephrolithotomy, Ureteroscopy, PCNL
+broken bone / fracture → Fracture
+appendix pain → Appendicectomy
+gallbladder / gallstone → Cholecystectomy
+eye problem / cataract → Cataract Surgery
+knee pain / knee problem → Total Knee Replacement, Arthroscopic Meniscus Repair
+hip pain / hip fracture → Total Hip Replacement, Fracture
+brain surgery / head injury → Craniotomy
+stroke / paralysis → Acute Ischemic Stroke
+cancer / tumor → Mastectomy, Radical Nephrectomy, Wide Excision
+burn / fire injury → Thermal burns, Electrical contact burns
+hernia → Hernia
+blood needed / weakness with low hb → Blood Transfusion, Anemia
+delivery / pregnancy → Caesarean Section
+uterus removal → Hysterectomy
+prostate → TURP
+breathing problem → Congestive heart failure, COPD
+infection / sepsis → Sepsis
+tonsil → Tonsillectomy
 
 ABBREVIATIONS:
-CABG=Coronary Artery Bypass Grafting, PTCA=Percutaneous Transluminal Coronary Angioplasty, TKR=Total Knee Replacement, THR=Total Hip Replacement, TURP=Transurethral Resection of Prostate, TURBT=Transurethral Resection of Bladder Tumour, LAP CHOLE=Laparoscopic Cholecystectomy, ERCP=Endoscopic Retrograde Cholangiopancreatography, ORIF=Open Reduction Internal Fixation, LSCS=Lower Segment Caesarean Section, NPWT=Negative Pressure Wound Therapy, ASD=Atrial Septal Defect, VSD=Ventricular Septal Defect, DVT=Deep Vein Thrombosis, COPD=Chronic Obstructive Pulmonary Disease
+CABG=Coronary Artery Bypass Grafting, PTCA=Percutaneous Transluminal Coronary Angioplasty, TKR=Total Knee Replacement, THR=Total Hip Replacement, TURP=Transurethral Resection of Prostate, LAP CHOLE=Laparoscopic Cholecystectomy, ERCP=Endoscopic Retrograde Cholangiopancreatography, ORIF=Open Reduction Internal Fixation, LSCS=Lower Segment Caesarean Section, NPWT=Negative Pressure Wound Therapy
 
-VALID PACKAGE NAMES (use these exact terms):
-Coronary Artery Bypass Grafting, PTCA, Coronary Angiography, Pacemaker Implantation, Congestive heart failure, Systemic Thrombolysis, Appendicectomy, Cholecystectomy, Hernia, Colostomy, Thyroidectomy, Splenectomy, Exploratory Laparotomy, Total Hip Replacement, Total Knee Replacement, Fracture, Arthroscopic Meniscus Repair, Craniotomy, Acute Ischemic Stroke, Mastectomy, Nephrectomy, Hysterectomy, Caesarean Section, TURP, TURBT, Cataract Surgery, Tonsillectomy, Septoplasty, Cochlear Implant, ERCP, Thermal burns, Electrical contact burns, Blood Transfusion, ICU, NPWT, Sepsis, Anemia
+VALID PACKAGE NAMES:
+Coronary Artery Bypass Grafting, PTCA, Coronary Angiography, Pacemaker Implantation, Congestive heart failure, Systemic Thrombolysis, Appendicectomy, Cholecystectomy, Hernia, Colostomy, Thyroidectomy, Splenectomy, Exploratory Laparotomy, Total Hip Replacement, Total Knee Replacement, Fracture, Arthroscopic Meniscus Repair, Craniotomy, Acute Ischemic Stroke, Mastectomy, Nephrectomy, Nephrolithotomy, Ureteroscopy, Hysterectomy, Caesarean Section, TURP, TURBT, Cataract Surgery, Tonsillectomy, Septoplasty, Cochlear Implant, ERCP, Thermal burns, Electrical contact burns, Blood Transfusion, ICU, NPWT, Sepsis, Anemia, PCNL
+
+EXAMPLES:
+"heart attack" → {{"keywords": ["Coronary Angiography", "PTCA", "Systemic Thrombolysis"], "patient_type": "Adult"}}
+"Patient having heart attack" → {{"keywords": ["Coronary Angiography", "PTCA", "Systemic Thrombolysis"], "patient_type": "Adult"}}
+"kidney stone" → {{"keywords": ["Nephrolithotomy", "Ureteroscopy"], "patient_type": "Adult"}}
+"Patient with kidney stone pain" → {{"keywords": ["Nephrolithotomy", "Ureteroscopy"], "patient_type": "Adult"}}
+"broken leg" → {{"keywords": ["Fracture"], "patient_type": "Adult"}}
+"CABG" → {{"keywords": ["Coronary Artery Bypass Grafting"], "patient_type": "Adult"}}
+"Sepsis, Anemia" → {{"keywords": ["Sepsis", "Anemia"], "patient_type": "Adult"}}
+"58yo diabetic with chest pain and reduced EF" → {{"keywords": ["Coronary Angiography", "PTCA", "Congestive heart failure"], "patient_type": "Adult"}}
+"5yo child with intussusception" → {{"keywords": ["Intussusception"], "patient_type": "Pediatric"}}
+"patient burn from fire 40% body" → {{"keywords": ["Thermal burns"], "patient_type": "Adult"}}
+"old man fell down hip broken" → {{"keywords": ["Total Hip Replacement", "Fracture"], "patient_type": "Adult"}}
 
 Input: "{request.query}"
 
