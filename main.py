@@ -1846,89 +1846,36 @@ def _sync_session_db(session_id: str, flow: Any, sels: list[dict], pt_type: str 
 
 @app.post("/interactive-search/analyze-query")
 async def analyze_interactive_query(request: AnalyzeQueryRequest):
-    """NLP analysis of free-text patient history → clinical keywords + patient type."""
+    """NLP analysis of free-text patient history → exact PMJAY package name keywords."""
     if not _async_groq_client:
         raise HTTPException(500, "Groq client not initialised")
 
-    prompt = f"""You are a master clinician AND an expert in PMJAY/Ayushman Bharat/MAA Yojana package naming.
+    prompt = f"""You are a PMJAY/MAA Yojana package keyword extractor.
 
-YOUR JOB: Analyze the user's input and produce the correct search keywords.
+TASK: Convert user input into ONLY medical keywords. NO summaries. NO sentences. NO explanations.
 
-═══ CRITICAL RULES (READ FIRST) ═══
+RULES:
+1. SIMPLE INPUT (1-3 words like procedure/disease/abbreviation):
+   → Return as-is or expand abbreviation. Nothing else.
+   → "CABG" → ["Coronary Artery Bypass Grafting"]
+   → "Anemia" → ["Anemia"]
+   → "Colostomy" → ["Colostomy"]
 
-RULE A — SIMPLE INPUT (1-3 words, direct terms like a procedure name, disease, diagnosis, or abbreviation):
-  → Just return that term as-is (or its full medical form if abbreviated).
-  → Do NOT invent related procedures or add-ons.
-  → Do NOT over-interpret. If user types "Anemia", keyword = ["Anemia"]. That's it.
-  → If user types "CABG", keyword = ["Coronary Artery Bypass Grafting"]. That's it.
-  → If user types "Colostomy", keyword = ["Colostomy"]. That's it.
-  → If user types "Sepsis, Anemia", keywords = ["Sepsis", "Anemia"]. That's it.
+2. COMMA-SEPARATED: Each term = one keyword. Expand abbreviations.
+   → "CABG, Blood Transfusion" → ["Coronary Artery Bypass Grafting", "Blood Transfusion"]
 
-RULE B — COMMA-SEPARATED TERMS (user lists multiple procedures/diseases separated by commas):
-  → Each comma-separated term becomes its own keyword.
-  → Expand abbreviations to full medical terms. Do NOT merge or reinterpret.
-  → Example: "CABG, Blood Transfusion" → ["Coronary Artery Bypass Grafting", "Blood Transfusion"]
+3. COMPLEX HISTORY (sentence/paragraph): Extract clinical keywords only. Max 6.
+   → "58yo diabetic with chest pain" → ["Coronary Angiography", "PTCA", "Congestive heart failure"]
 
-RULE C — COMPLEX CLINICAL HISTORY (a sentence/paragraph describing patient history, symptoms, age, etc.):
-  → ONLY in this case, think like a treating doctor and generate clinical keywords.
-  → Expand abbreviations to their PMJAY package name equivalents.
-  → Include: PRIMARY procedure/diagnosis + SUPPORTIVE add-ons if clinically needed.
-  → Use exact package name fragments from the reference list below.
-  → Maximum 6 keywords.
+ABBREVIATIONS:
+CABG=Coronary Artery Bypass Grafting, PTCA=Percutaneous Transluminal Coronary Angioplasty, TKR=Total Knee Replacement, THR=Total Hip Replacement, TURP=Transurethral Resection of Prostate, TURBT=Transurethral Resection of Bladder Tumour, LAP CHOLE=Laparoscopic Cholecystectomy, ERCP=Endoscopic Retrograde Cholangiopancreatography, ORIF=Open Reduction Internal Fixation, LSCS=Lower Segment Caesarean Section, NPWT=Negative Pressure Wound Therapy, ASD=Atrial Septal Defect, VSD=Ventricular Septal Defect, DVT=Deep Vein Thrombosis, COPD=Chronic Obstructive Pulmonary Disease
 
-═══ HOW TO DECIDE SIMPLE vs COMPLEX ═══
-- SIMPLE: "CABG", "Anemia", "Colostomy", "Hernia", "PTCA", "Appendicectomy", "Sepsis, Anemia"
-- COMPLEX: "58yo male diabetic with chest pain and reduced EF", "Patient with oral cancer on chemo with weakness and bed sores"
-- If unsure, treat as SIMPLE.
-
-═══ COMMON ABBREVIATIONS (expand these) ═══
-CABG = Coronary Artery Bypass Grafting
-PTCA = Percutaneous Transluminal Coronary Angioplasty  
-TKR = Total Knee Replacement
-THR = Total Hip Replacement
-TURP = Transurethral Resection of Prostate
-TURBT = Transurethral Resection of Bladder Tumour
-LAP CHOLE = Laparoscopic Cholecystectomy
-ERCP = Endoscopic Retrograde Cholangiopancreatography
-D&C = Dilatation and Curettage
-ORIF = Open Reduction Internal Fixation
-LSCS = Lower Segment Caesarean Section
-MTP = Medical Termination of Pregnancy
-NPWT = Negative Pressure Wound Therapy
-ASD = Atrial Septal Defect
-VSD = Ventricular Septal Defect
-PDA = Patent Ductus Arteriosus
-COPD = Chronic Obstructive Pulmonary Disease
-DVT = Deep Vein Thrombosis
-
-═══ PACKAGE NAME REFERENCE (for complex histories, use these exact terms) ═══
-
-CARDIOLOGY: Coronary Artery Bypass Grafting, PTCA, Coronary Angiography, Peripheral Angioplasty - POBA, Pacemaker Implantation, ASD Device Closure, VSD Device Closure, Congestive heart failure, Atrial Fibrillation, Systemic Thrombolysis, Aortic Aneurysm Repair
-GENERAL SURGERY: Appendicectomy, Cholecystectomy, Hernia, Exploratory Laparotomy, Colostomy, Thyroidectomy, Splenectomy, Pilonidal Sinus, Fistulectomy, Necrotising Fascitis
-ORTHOPAEDICS: Total Hip Replacement, Total Knee Replacement, Fracture - Neck Femur, Fracture - Long Bones, Arthroscopic Meniscus Repair, Spine deformity correction, Lumbar Discectomy
-ONCOLOGY: CT for CA Head & Neck, CT for CA Breast, CT for CA Lung, CT for Colorectal Cancer, Mastectomy, Radical Nephrectomy, Radical Hysterectomy, Wide Excision- Oral Cavity Malignancy
-UROLOGY: TURP, TURBT, Nephrectomy, Nephrolithotomy, Ureteroscopy, Cystectomy, Urethroplasty
-NEUROSURGERY: Craniotomy, Acute Ischemic Stroke, Epilepsy Surgery, Shunt Surgery, Aneurysm Clipping
-BURNS: Thermal burns, Flame burns, Electrical contact burns, Chemical burns, Post Burn Contracture
-ENT: Tonsillectomy, Septoplasty, Tympanoplasty, Cochlear Implant
-OPHTHALMOLOGY: Cataract Surgery, Vitreoretinal Surgery, Glaucoma surgery
-GASTROENTEROLOGY: ERCP, Upper GI bleeding, Acute necrotizing severe pancreatitis, Liver abscess
-OBS/GYN: Hysterectomy, Caesarean Section, D&C, Medical Termination of Pregnancy
-SUPPORTIVE/ADD-ON: Blood Transfusion, ICU, Feeding Jejunostomy, NPWT, Supportive care for long term patient, Pressure ulcer management
-
-═══ EXAMPLES ═══
-Input: "CABG" → {{"summary": "Patient needs coronary artery bypass grafting.", "keywords": ["Coronary Artery Bypass Grafting"], "patient_type": "Adult"}}
-Input: "Colostomy" → {{"summary": "Patient needs colostomy procedure.", "keywords": ["Colostomy"], "patient_type": "Adult"}}
-Input: "Anemia" → {{"summary": "Patient has anemia.", "keywords": ["Anemia"], "patient_type": "Adult"}}
-Input: "Sepsis, Anemia" → {{"summary": "Patient has sepsis and anemia.", "keywords": ["Sepsis", "Anemia"], "patient_type": "Adult"}}
-Input: "PTCA" → {{"summary": "Patient needs percutaneous transluminal coronary angioplasty.", "keywords": ["PTCA"], "patient_type": "Adult"}}
-Input: "Hernia, Blood Transfusion" → {{"summary": "Patient needs hernia repair with blood transfusion support.", "keywords": ["Hernia", "Blood Transfusion"], "patient_type": "Adult"}}
-Input: "58yo diabetic with chest pain and reduced EF" → {{"summary": "Elderly diabetic male with acute coronary syndrome and heart failure.", "keywords": ["Coronary Angiography", "PTCA", "Coronary Artery Bypass Grafting", "Congestive heart failure"], "patient_type": "Adult"}}
-Input: "5yo child with intussusception" → {{"summary": "Pediatric patient with intussusception requiring surgical intervention.", "keywords": ["Intussusception"], "patient_type": "Pediatric"}}
+VALID PACKAGE NAMES (use these exact terms):
+Coronary Artery Bypass Grafting, PTCA, Coronary Angiography, Pacemaker Implantation, Congestive heart failure, Systemic Thrombolysis, Appendicectomy, Cholecystectomy, Hernia, Colostomy, Thyroidectomy, Splenectomy, Exploratory Laparotomy, Total Hip Replacement, Total Knee Replacement, Fracture, Arthroscopic Meniscus Repair, Craniotomy, Acute Ischemic Stroke, Mastectomy, Nephrectomy, Hysterectomy, Caesarean Section, TURP, TURBT, Cataract Surgery, Tonsillectomy, Septoplasty, Cochlear Implant, ERCP, Thermal burns, Electrical contact burns, Blood Transfusion, ICU, NPWT, Sepsis, Anemia
 
 Input: "{request.query}"
 
-Return ONLY valid JSON: {{"summary": "...", "keywords": ["..."], "patient_type": "Adult" or "Pediatric"}}"""
+Return ONLY: {{"keywords": ["..."], "patient_type": "Adult"|"Pediatric"}}"""
 
     try:
         resp = await _async_groq_client.chat.completions.create(
@@ -1939,7 +1886,7 @@ Return ONLY valid JSON: {{"summary": "...", "keywords": ["..."], "patient_type":
         parsed = json.loads(resp.choices[0].message.content)
 
         keywords = parsed.get("keywords") or [request.query]
-        # Hard cap at 6 keywords (doctor-driven: diagnosis + procedures + supportive)
+        # Hard cap at 6 keywords
         if len(keywords) > 6:
             keywords = keywords[:6]
 
@@ -1948,44 +1895,36 @@ Return ONLY valid JSON: {{"summary": "...", "keywords": ["..."], "patient_type":
         if ai_patient_type not in ("Adult", "Pediatric"):
             ai_patient_type = _detect_patient_type_from_text(request.query)
 
-        # ── MAP TO EXACT PACKAGE NAMES FROM ASSETS ──
-        # The user specifically wants the 'keywords' array to contain the EXACT
-        # package names from the JSON assets, not just generic LLM outputs.
-        # We will use the ultra-smart package agent to find the exact matches!
-        from tools.smart_package_agent import intelligent_package_search
-        
-        search_data = {
-            "diagnosis": request.query,
-            "search_terms": keywords,
-            "department": "",
-            "surgery_name": "",
-            "procedure_name": "",
-            "chief_complaints": [],
-            "secondary_diagnoses": [],
-            "surgery_required": True,
-            "procedure_required": True
-        }
-        
-        # Run the smart matching engine without the LLM override step to be fast
-        smart_results = intelligent_package_search(search_data, use_llm=False, top_k=5)
-        
-        exact_package_names = []
-        for pkg in smart_results.get("primary_packages", []) + smart_results.get("addon_packages", []) + smart_results.get("implant_packages", []):
-            full_name = pkg.get("package_name", pkg.get("PACKAGE NAME", ""))
-            if full_name:
-                # Extract just the short package name (everything before the first '|')
-                short_name = full_name.split("|")[0].replace("\n", " ").strip()
-                if short_name and short_name not in exact_package_names:
-                    exact_package_names.append(short_name)
-                
-        # If we found exact packages, use them as the keywords!
-        if exact_package_names:
-            final_keywords = exact_package_names[:6]
-        else:
-            final_keywords = keywords
+        # ── MAP EACH KEYWORD TO EXACT PACKAGE NAME FROM ASSETS ──
+        # Search each keyword individually for precise package-name matching
+        _load_packages_cache()
+        exact_package_names: list[str] = []
+        seen_names: set[str] = set()
+
+        for kw in keywords:
+            matches = _search_packages_basic(kw, limit=3, patient_type=ai_patient_type)
+            if matches:
+                # Take the top match and extract short package name
+                best = matches[0]
+                full_name = pkg_name(best)
+                short = full_name.split("|")[0].replace("\n", " ").strip()
+                if short and short.lower() not in seen_names:
+                    exact_package_names.append(short)
+                    seen_names.add(short.lower())
+            else:
+                # No match found — keep original keyword as-is
+                kw_clean = kw.strip()
+                if kw_clean and kw_clean.lower() not in seen_names:
+                    exact_package_names.append(kw_clean)
+                    seen_names.add(kw_clean.lower())
+
+        final_keywords = exact_package_names[:6] if exact_package_names else keywords
+
+        # Auto-generate minimal summary from keywords (backward compat)
+        auto_summary = ", ".join(final_keywords)
 
         return JSONResponse(content={
-            "summary": parsed.get("summary", "No summary."),
+            "summary": auto_summary,
             "keywords": final_keywords,
             "patient_type": ai_patient_type,
         })
@@ -1993,7 +1932,7 @@ Return ONLY valid JSON: {{"summary": "...", "keywords": ["..."], "patient_type":
         logger.error("Query analysis failed: %s", e)
         detected_pt = _detect_patient_type_from_text(request.query)
         return JSONResponse(content={
-            "summary": f"Analysis failed. Original: {request.query}",
+            "summary": request.query,
             "keywords": [request.query],
             "patient_type": detected_pt,
         })
