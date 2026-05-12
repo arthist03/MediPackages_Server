@@ -1938,7 +1938,7 @@ Return ONLY: {{"keywords": ["..."], "patient_type": "Adult"|"Pediatric"}}"""
 
     try:
         resp = await _async_groq_client.chat.completions.create(
-            model="openai/gpt-oss-120b",
+            model=GROQ_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0, response_format={"type": "json_object"},
         )
