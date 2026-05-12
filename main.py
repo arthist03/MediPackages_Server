@@ -1527,19 +1527,30 @@ async def send_push_notification(req: PushNotificationRequest, api_key: str = De
 async def smart_search(request: SmartSearchRequest):
     """AI-powered MAA Yojana package search with clinical reasoning."""
     import asyncio
-    expanded_query, expanded_proc, expanded_dis = await asyncio.gather(
-        _expand_abbreviations_llm(request.query),
-        _expand_abbreviations_llm(request.procedure),
-        _expand_abbreviations_llm(request.disease)
-    )
     
-    query_terms = _split_query_terms(expanded_query)
-    if expanded_proc:
-        _append_unique_term(query_terms, expanded_proc)
-    if expanded_dis:
-        _append_unique_term(query_terms, expanded_dis)
+    extracted_history_summary = ""
+    spelling_corrections = {}
+    
+    # NLP History Extraction (Triggered if query is a long sentence/paragraph)
+    if len((request.query or "").split()) > 3:
+        hist_res = await _extract_keywords_from_history(request.query)
+        query_terms = hist_res.get("keywords", [])
+        if not hasattr(request, 'patient_type') or not request.patient_type:
+            request.patient_type = hist_res.get("patient_type", "")
+        extracted_history_summary = hist_res.get("summary", "")
         
-    query_terms, spelling_corrections = _correct_query_terms_spelling(query_terms)
+        expanded_proc, expanded_dis = await asyncio.gather(
+            _expand_abbreviations_llm(request.procedure),
+            _expand_abbreviations_llm(request.disease)
+        )
+    else:
+        expanded_query, expanded_proc, expanded_dis = await asyncio.gather(
+            _expand_abbreviations_llm(request.query),
+            _expand_abbreviations_llm(request.procedure),
+            _expand_abbreviations_llm(request.disease)
+        )
+        query_terms = _split_query_terms(expanded_query)
+        query_terms, spelling_corrections = _correct_query_terms_spelling(query_terms)
 
     main_term = query_terms[0] if query_terms else ""
     addon_terms = query_terms[1:] if len(query_terms) > 1 else []
@@ -1779,6 +1790,12 @@ Return ONLY approved-likely packages."""
                 f"Spelling correction: {', '.join(f'{s}→{d}' for s, d in spelling_corrections.items())}\n\n"
                 + result.doctor_reasoning
             )
+            
+        if extracted_history_summary:
+            result.doctor_reasoning = (
+                f"Extracted clinical keywords from history: {extracted_history_summary}\n\n"
+                + result.doctor_reasoning
+            )
 
         logger.info("Smart search '%s' → %d packages, %d violations", main_term, len(selected_codes), len(violations))
         return result
@@ -1844,11 +1861,13 @@ def _sync_session_db(session_id: str, flow: Any, sels: list[dict], pt_type: str 
         logger.error("Failed to sync session: %s", e)
 
 
-@app.post("/interactive-search/analyze-query")
-async def analyze_interactive_query(request: AnalyzeQueryRequest):
-    """NLP analysis of free-text patient history → exact PMJAY package name keywords."""
+async def _extract_keywords_from_history(query: str) -> dict:
     if not _async_groq_client:
-        raise HTTPException(500, "Groq client not initialised")
+        return {
+            "summary": query,
+            "keywords": [query],
+            "patient_type": _detect_patient_type_from_text(query),
+        }
 
     prompt = f"""You are a PMJAY/MAA Yojana package keyword extractor. Think like a treating doctor.
 
@@ -1913,7 +1932,7 @@ EXAMPLES:
 "patient burn from fire 40% body" → {{"keywords": ["Thermal burns"], "patient_type": "Adult"}}
 "old man fell down hip broken" → {{"keywords": ["Total Hip Replacement", "Fracture"], "patient_type": "Adult"}}
 
-Input: "{request.query}"
+Input: "{query}"
 
 Return ONLY: {{"keywords": ["..."], "patient_type": "Adult"|"Pediatric"}}"""
 
@@ -1925,7 +1944,7 @@ Return ONLY: {{"keywords": ["..."], "patient_type": "Adult"|"Pediatric"}}"""
         )
         parsed = json.loads(resp.choices[0].message.content)
 
-        keywords = parsed.get("keywords") or [request.query]
+        keywords = parsed.get("keywords") or [query]
         # Hard cap at 6 keywords
         if len(keywords) > 6:
             keywords = keywords[:6]
@@ -1933,7 +1952,7 @@ Return ONLY: {{"keywords": ["..."], "patient_type": "Adult"|"Pediatric"}}"""
         # Determine patient type from AI response + fallback heuristic
         ai_patient_type = parsed.get("patient_type", "").strip()
         if ai_patient_type not in ("Adult", "Pediatric"):
-            ai_patient_type = _detect_patient_type_from_text(request.query)
+            ai_patient_type = _detect_patient_type_from_text(query)
 
         # ── MAP EACH KEYWORD TO EXACT PACKAGE NAME FROM ASSETS ──
         # Search each keyword individually for precise package-name matching
@@ -1959,23 +1978,27 @@ Return ONLY: {{"keywords": ["..."], "patient_type": "Adult"|"Pediatric"}}"""
                     seen_names.add(kw_clean.lower())
 
         final_keywords = exact_package_names[:6] if exact_package_names else keywords
-
-        # Auto-generate minimal summary from keywords (backward compat)
         auto_summary = ", ".join(final_keywords)
 
-        return JSONResponse(content={
+        return {
             "summary": auto_summary,
             "keywords": final_keywords,
             "patient_type": ai_patient_type,
-        })
+        }
     except Exception as e:
         logger.error("Query analysis failed: %s", e)
-        detected_pt = _detect_patient_type_from_text(request.query)
-        return JSONResponse(content={
-            "summary": request.query,
-            "keywords": [request.query],
+        detected_pt = _detect_patient_type_from_text(query)
+        return {
+            "summary": query,
+            "keywords": [query],
             "patient_type": detected_pt,
-        })
+        }
+
+@app.post("/interactive-search/analyze-query")
+async def analyze_interactive_query(request: AnalyzeQueryRequest):
+    """NLP analysis of free-text patient history → exact PMJAY package name keywords."""
+    res = await _extract_keywords_from_history(request.query)
+    return JSONResponse(content=res)
 
 
 def _detect_patient_type_from_text(text: str) -> str:
