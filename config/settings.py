@@ -59,7 +59,7 @@ LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "4096"))
 # ── Groq API (Free fallback) ─────────────────────────────────────────
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL = os.getenv(
-    "GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+    "GROQ_MODEL", "llama3-8b-8192")
 
 # ── Fallback: Local LLM (llama.cpp) ───────────────────────────────────
 USE_LOCAL_LLM = os.getenv("USE_LOCAL_LLM", "false").lower() == "true"

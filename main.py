@@ -1871,9 +1871,11 @@ async def _extract_keywords_from_history(query: str) -> dict:
 
     prompt = f"""You are a PMJAY/MAA Yojana package keyword extractor. Think like a treating doctor.
 
-TASK: Convert user input into EXACT medical package name keywords. NO summaries. NO sentences. NO explanations. ONLY keywords.
+TASK: 
+1. Generate a brief 2-5 word clinical summary of the patient's condition.
+2. Convert user input into EXACT medical package name keywords.
 
-CRITICAL: NEVER return the user's input as-is. ALWAYS translate to medical/package terminology.
+CRITICAL: NEVER return the user's input as-is for keywords. ALWAYS translate to medical/package terminology.
 
 RULES:
 1. DIRECT PROCEDURE/DISEASE NAME (already a medical term):
@@ -1920,21 +1922,21 @@ VALID PACKAGE NAMES:
 Coronary Artery Bypass Grafting, PTCA, Coronary Angiography, Pacemaker Implantation, Congestive heart failure, Systemic Thrombolysis, Appendicectomy, Cholecystectomy, Hernia, Colostomy, Thyroidectomy, Splenectomy, Exploratory Laparotomy, Total Hip Replacement, Total Knee Replacement, Fracture, Arthroscopic Meniscus Repair, Craniotomy, Acute Ischemic Stroke, Mastectomy, Nephrectomy, Nephrolithotomy, Ureteroscopy, Hysterectomy, Caesarean Section, TURP, TURBT, Cataract Surgery, Tonsillectomy, Septoplasty, Cochlear Implant, ERCP, Thermal burns, Electrical contact burns, Blood Transfusion, ICU, NPWT, Sepsis, Anemia, PCNL
 
 EXAMPLES:
-"heart attack" → {{"keywords": ["Coronary Angiography", "PTCA", "Systemic Thrombolysis"], "patient_type": "Adult"}}
-"Patient having heart attack" → {{"keywords": ["Coronary Angiography", "PTCA", "Systemic Thrombolysis"], "patient_type": "Adult"}}
-"kidney stone" → {{"keywords": ["Nephrolithotomy", "Ureteroscopy"], "patient_type": "Adult"}}
-"Patient with kidney stone pain" → {{"keywords": ["Nephrolithotomy", "Ureteroscopy"], "patient_type": "Adult"}}
-"broken leg" → {{"keywords": ["Fracture"], "patient_type": "Adult"}}
-"CABG" → {{"keywords": ["Coronary Artery Bypass Grafting"], "patient_type": "Adult"}}
-"Sepsis, Anemia" → {{"keywords": ["Sepsis", "Anemia"], "patient_type": "Adult"}}
-"58yo diabetic with chest pain and reduced EF" → {{"keywords": ["Coronary Angiography", "PTCA", "Congestive heart failure"], "patient_type": "Adult"}}
-"5yo child with intussusception" → {{"keywords": ["Intussusception"], "patient_type": "Pediatric"}}
-"patient burn from fire 40% body" → {{"keywords": ["Thermal burns"], "patient_type": "Adult"}}
-"old man fell down hip broken" → {{"keywords": ["Total Hip Replacement", "Fracture"], "patient_type": "Adult"}}
+"heart attack" → {{"summary": "Acute Myocardial Infarction", "keywords": ["Coronary Angiography", "PTCA", "Systemic Thrombolysis"], "patient_type": "Adult"}}
+"Patient having heart attack" → {{"summary": "Acute Myocardial Infarction", "keywords": ["Coronary Angiography", "PTCA", "Systemic Thrombolysis"], "patient_type": "Adult"}}
+"kidney stone" → {{"summary": "Renal Calculi", "keywords": ["Nephrolithotomy", "Ureteroscopy"], "patient_type": "Adult"}}
+"Patient with kidney stone pain" → {{"summary": "Renal Calculi", "keywords": ["Nephrolithotomy", "Ureteroscopy"], "patient_type": "Adult"}}
+"broken leg" → {{"summary": "Leg Fracture", "keywords": ["Fracture"], "patient_type": "Adult"}}
+"CABG" → {{"summary": "Coronary Artery Bypass", "keywords": ["Coronary Artery Bypass Grafting"], "patient_type": "Adult"}}
+"Sepsis, Anemia" → {{"summary": "Sepsis with Anemia", "keywords": ["Sepsis", "Anemia"], "patient_type": "Adult"}}
+"58yo diabetic with chest pain and reduced EF" → {{"summary": "Diabetic with Angina/HF", "keywords": ["Coronary Angiography", "PTCA", "Congestive heart failure"], "patient_type": "Adult"}}
+"5yo child with intussusception" → {{"summary": "Pediatric Intussusception", "keywords": ["Intussusception"], "patient_type": "Pediatric"}}
+"patient burn from fire 40% body" → {{"summary": "40% Thermal Burns", "keywords": ["Thermal burns"], "patient_type": "Adult"}}
+"old man fell down hip broken" → {{"summary": "Hip Fracture", "keywords": ["Total Hip Replacement", "Fracture"], "patient_type": "Adult"}}
 
 Input: "{query}"
 
-Return ONLY: {{"keywords": ["..."], "patient_type": "Adult"|"Pediatric"}}"""
+Return ONLY: {{"summary": "...", "keywords": ["..."], "patient_type": "Adult"|"Pediatric"}}"""
 
     try:
         resp = await _async_groq_client.chat.completions.create(
@@ -1978,10 +1980,12 @@ Return ONLY: {{"keywords": ["..."], "patient_type": "Adult"|"Pediatric"}}"""
                     seen_names.add(kw_clean.lower())
 
         final_keywords = exact_package_names[:6] if exact_package_names else keywords
-        auto_summary = ", ".join(final_keywords)
+        
+        # Use the clinical summary from the LLM if available, fallback to the original query
+        clinical_summary = parsed.get("summary", query)
 
         return {
-            "summary": auto_summary,
+            "summary": clinical_summary,
             "keywords": final_keywords,
             "patient_type": ai_patient_type,
         }
