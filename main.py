@@ -999,6 +999,14 @@ app = FastAPI(
     openapi_url="/openapi.json" if ENABLE_DOCS else None,
 )
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=CORS_ALLOW_CREDENTIALS,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 class RequestContextMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -1874,69 +1882,25 @@ async def _extract_keywords_from_history(query: str) -> dict:
 TASK: 
 1. Generate a brief 2-5 word clinical summary of the patient's condition.
 2. Convert user input into EXACT medical package name keywords.
+3. Write brief instructions for the PMJAY MSSO operator (e.g., "Admit under Cardiology, book PTCA").
 
-CRITICAL: NEVER return the user's input as-is for keywords. ALWAYS translate to medical/package terminology.
-
-RULES:
-1. DIRECT PROCEDURE/DISEASE NAME (already a medical term):
-   → Return as-is or expand abbreviation.
-   → "CABG" → ["Coronary Artery Bypass Grafting"]
-   → "Anemia" → ["Anemia"]
-   → "Colostomy" → ["Colostomy"]
-
-2. COMMA-SEPARATED: Each term = one keyword. Expand abbreviations.
-   → "CABG, Blood Transfusion" → ["Coronary Artery Bypass Grafting", "Blood Transfusion"]
-
-3. LAYMAN/CLINICAL DESCRIPTION (any sentence, symptom, or common language):
-   → ALWAYS convert to the correct medical procedure/diagnosis package names.
-   → Think: What would a doctor diagnose? What packages would be booked?
-   → Max 6 keywords.
-
-LAYMAN TERM → PACKAGE NAME MAP (MUST USE):
-heart attack / MI → Coronary Angiography, PTCA, Coronary Artery Bypass Grafting, Systemic Thrombolysis
-chest pain → Coronary Angiography, PTCA
-kidney stone → Nephrolithotomy, Ureteroscopy, PCNL
-broken bone / fracture → Fracture
-appendix pain → Appendicectomy
-gallbladder / gallstone → Cholecystectomy
-eye problem / cataract → Cataract Surgery
-knee pain / knee problem → Total Knee Replacement, Arthroscopic Meniscus Repair
-hip pain / hip fracture → Total Hip Replacement, Fracture
-brain surgery / head injury → Craniotomy
-stroke / paralysis → Acute Ischemic Stroke
-cancer / tumor → Mastectomy, Radical Nephrectomy, Wide Excision
-burn / fire injury → Thermal burns, Electrical contact burns
-hernia → Hernia
-blood needed / weakness with low hb → Blood Transfusion, Anemia
-delivery / pregnancy → Caesarean Section
-uterus removal → Hysterectomy
-prostate → TURP
-breathing problem → Congestive heart failure, COPD
-infection / sepsis → Sepsis
-tonsil → Tonsillectomy
-
-ABBREVIATIONS:
-CABG=Coronary Artery Bypass Grafting, PTCA=Percutaneous Transluminal Coronary Angioplasty, TKR=Total Knee Replacement, THR=Total Hip Replacement, TURP=Transurethral Resection of Prostate, LAP CHOLE=Laparoscopic Cholecystectomy, ERCP=Endoscopic Retrograde Cholangiopancreatography, ORIF=Open Reduction Internal Fixation, LSCS=Lower Segment Caesarean Section, NPWT=Negative Pressure Wound Therapy
+CRITICAL RULES:
+1. ONLY return ONE package keyword per distinct medical condition. Do NOT return multiple packages for the same condition (e.g., for heart attack, pick ONLY the most appropriate primary intervention, like "PTCA" OR "Coronary Angiography", NOT both).
+2. If the user mentions multiple conditions (e.g., "heart attack and kidney stone"), return ONE package keyword for the first, and ONE for the second.
+3. If the user's input is a layman term (e.g. "heart attack"), translate it to medical terminology. If the user's input is ALREADY a valid medical diagnosis or procedure (e.g. "Anemia", "Sepsis", "Appendectomy"), keep it exactly as-is. NEVER force a diagnosis to become a treatment (e.g., do NOT translate "Anemia" into "Blood Transfusion").
 
 VALID PACKAGE NAMES:
 Coronary Artery Bypass Grafting, PTCA, Coronary Angiography, Pacemaker Implantation, Congestive heart failure, Systemic Thrombolysis, Appendicectomy, Cholecystectomy, Hernia, Colostomy, Thyroidectomy, Splenectomy, Exploratory Laparotomy, Total Hip Replacement, Total Knee Replacement, Fracture, Arthroscopic Meniscus Repair, Craniotomy, Acute Ischemic Stroke, Mastectomy, Nephrectomy, Nephrolithotomy, Ureteroscopy, Hysterectomy, Caesarean Section, TURP, TURBT, Cataract Surgery, Tonsillectomy, Septoplasty, Cochlear Implant, ERCP, Thermal burns, Electrical contact burns, Blood Transfusion, ICU, NPWT, Sepsis, Anemia, PCNL
 
 EXAMPLES:
-"heart attack" → {{"summary": "Acute Myocardial Infarction", "keywords": ["Coronary Angiography", "PTCA", "Systemic Thrombolysis"], "patient_type": "Adult"}}
-"Patient having heart attack" → {{"summary": "Acute Myocardial Infarction", "keywords": ["Coronary Angiography", "PTCA", "Systemic Thrombolysis"], "patient_type": "Adult"}}
-"kidney stone" → {{"summary": "Renal Calculi", "keywords": ["Nephrolithotomy", "Ureteroscopy"], "patient_type": "Adult"}}
-"Patient with kidney stone pain" → {{"summary": "Renal Calculi", "keywords": ["Nephrolithotomy", "Ureteroscopy"], "patient_type": "Adult"}}
-"broken leg" → {{"summary": "Leg Fracture", "keywords": ["Fracture"], "patient_type": "Adult"}}
-"CABG" → {{"summary": "Coronary Artery Bypass", "keywords": ["Coronary Artery Bypass Grafting"], "patient_type": "Adult"}}
-"Sepsis, Anemia" → {{"summary": "Sepsis with Anemia", "keywords": ["Sepsis", "Anemia"], "patient_type": "Adult"}}
-"58yo diabetic with chest pain and reduced EF" → {{"summary": "Diabetic with Angina/HF", "keywords": ["Coronary Angiography", "PTCA", "Congestive heart failure"], "patient_type": "Adult"}}
-"5yo child with intussusception" → {{"summary": "Pediatric Intussusception", "keywords": ["Intussusception"], "patient_type": "Pediatric"}}
-"patient burn from fire 40% body" → {{"summary": "40% Thermal Burns", "keywords": ["Thermal burns"], "patient_type": "Adult"}}
-"old man fell down hip broken" → {{"summary": "Hip Fracture", "keywords": ["Total Hip Replacement", "Fracture"], "patient_type": "Adult"}}
+"heart attack" → {{"summary": "Acute Myocardial Infarction", "msso_instructions": "Admit under Cardiology. Book PTCA package.", "keywords": ["PTCA"], "patient_type": "Adult"}}
+"kidney stone" → {{"summary": "Renal Calculi", "msso_instructions": "Admit under Urology. Book PCNL or Ureteroscopy.", "keywords": ["PCNL"], "patient_type": "Adult"}}
+"Patient burn from fire 40% body and broken leg" → {{"summary": "40% Thermal Burns & Fracture", "msso_instructions": "Admit under Plastic Surgery and Orthopedics. Book Thermal Burns and Fracture.", "keywords": ["Thermal burns", "Fracture"], "patient_type": "Adult"}}
+"anemia" → {{"summary": "Anemia", "msso_instructions": "Admit under Medicine. Book Medical Management for Anemia.", "keywords": ["Anemia"], "patient_type": "Adult"}}
 
 Input: "{query}"
 
-Return ONLY: {{"summary": "...", "keywords": ["..."], "patient_type": "Adult"|"Pediatric"}}"""
+Return ONLY valid JSON in this format: {{"summary": "...", "msso_instructions": "...", "keywords": ["..."], "patient_type": "Adult"|"Pediatric"}}"""
 
     try:
         resp = await _async_groq_client.chat.completions.create(
@@ -1956,36 +1920,16 @@ Return ONLY: {{"summary": "...", "keywords": ["..."], "patient_type": "Adult"|"P
         if ai_patient_type not in ("Adult", "Pediatric"):
             ai_patient_type = _detect_patient_type_from_text(query)
 
-        # ── MAP EACH KEYWORD TO EXACT PACKAGE NAME FROM ASSETS ──
-        # Search each keyword individually for precise package-name matching
-        _load_packages_cache()
-        exact_package_names: list[str] = []
-        seen_names: set[str] = set()
-
-        for kw in keywords:
-            matches = _search_packages_basic(kw, limit=3, patient_type=ai_patient_type)
-            if matches:
-                # Take the top match and extract short package name
-                best = matches[0]
-                full_name = pkg_name(best)
-                short = full_name.split("|")[0].replace("\n", " ").strip()
-                if short and short.lower() not in seen_names:
-                    exact_package_names.append(short)
-                    seen_names.add(short.lower())
-            else:
-                # No match found — keep original keyword as-is
-                kw_clean = kw.strip()
-                if kw_clean and kw_clean.lower() not in seen_names:
-                    exact_package_names.append(kw_clean)
-                    seen_names.add(kw_clean.lower())
-
-        final_keywords = exact_package_names[:6] if exact_package_names else keywords
+        # Keep the exact medical keywords generated by the AI
+        final_keywords = keywords
         
         # Use the clinical summary from the LLM if available, fallback to the original query
         clinical_summary = parsed.get("summary", query)
+        msso_instructions = parsed.get("msso_instructions", "")
 
         return {
             "summary": clinical_summary,
+            "msso_instructions": msso_instructions,
             "keywords": final_keywords,
             "patient_type": ai_patient_type,
         }
@@ -1994,6 +1938,7 @@ Return ONLY: {{"summary": "...", "keywords": ["..."], "patient_type": "Adult"|"P
         detected_pt = _detect_patient_type_from_text(query)
         return {
             "summary": query,
+            "msso_instructions": "",
             "keywords": [query],
             "patient_type": detected_pt,
         }
