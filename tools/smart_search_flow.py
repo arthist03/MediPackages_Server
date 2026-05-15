@@ -1118,7 +1118,7 @@ def process_step_selection(
     # Term package selection → dynamic implant/strat insertion
     if current_step.context.get("is_term_selection") or current_step.context.get("is_primary_selection"):
         pkg_code = selected_option.get("code")
-        sel_pkg = next((p for p in all_packages if p.get("PACKAGE CODE") == pkg_code), None)
+        sel_pkg = next((p for p in all_packages if _get_pkg_field(p, ["PACKAGE CODE", "package_code"], "") == pkg_code), None)
         if sel_pkg and _is_standalone_pkg(sel_pkg):
             flow.mark_complete()
             return True, None
@@ -1126,6 +1126,40 @@ def process_step_selection(
         if sel_pkg:
             insert_idx = flow.current_step + 1
             intent_term = current_step.context.get("intent_term", _get_pkg_name(sel_pkg)[:30])
+            
+            # PMJAY Variant Step
+            if sel_pkg.get("_source") == "pmjay":
+                variants = [p for p in all_packages if p.get("_source") == "pmjay" and _get_pkg_field(p, ["PACKAGE CODE", "package_code"], "") == pkg_code]
+                if len(variants) > 1:
+                    variant_options = []
+                    for v in variants:
+                        v_rate = _get_pkg_rate(v)
+                        v_type = str(v.get("procedure_type", "Regular"))
+                        v_id = str(v.get("sr_no", ""))
+                        v_reservance = str(v.get("reservance", ""))
+                        if v_reservance and v_reservance.lower() != "nan":
+                            v_type += f" ({v_reservance})"
+                        variant_options.append({
+                            "id": f"variant_{v_id}",
+                            "code": pkg_code,
+                            "label": f"{v_type} (₹{v_rate})",
+                            "description": f"Rate: ₹{v_rate} | Type: {v_type}",
+                            "specialty": _get_pkg_spec(v),
+                            "rate": v_rate,
+                            "rank": len(variant_options) + 1,
+                            "reason": "Variant specific to hospital/patient type",
+                        })
+                    
+                    flow.steps.insert(insert_idx, SearchStep(
+                        step_number=insert_idx + 1,
+                        step_name=f"Select Variant for {intent_term.title()}",
+                        description="This PMJAY procedure has multiple rate variants (e.g. Insurer vs Trust). Please select the correct one:",
+                        options=variant_options,
+                        requires_user_selection=True,
+                        context={"main_package": pkg_code, "intent_term": intent_term, "is_variant_selection": True},
+                    ))
+                    insert_idx += 1
+
             # Stratification
             strat_options = generate_stratification_options(sel_pkg, all_packages)
             if strat_options:

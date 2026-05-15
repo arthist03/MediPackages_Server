@@ -228,15 +228,15 @@ PROCEDURE_ALIASES: dict[str, str] = {
 # ═══════════════════════════════════════════════════════════════════════
 
 def pkg_name(pkg: dict) -> str:
-    return str(pkg.get("PACKAGE NAME", pkg.get("Package Name", "")))
+    return str(pkg.get("PACKAGE NAME") or pkg.get("Package Name") or pkg.get("package_name") or "")
 
 
 def pkg_code(pkg: dict) -> str:
-    return str(pkg.get("PACKAGE CODE", ""))
+    return str(pkg.get("PACKAGE CODE") or pkg.get("package_code") or "")
 
 
 def pkg_rate(pkg: dict) -> float:
-    raw = pkg.get("RATE", pkg.get("Rate", 0))
+    raw = pkg.get("RATE") or pkg.get("Rate") or pkg.get("package_amount") or 0
     try:
         return float(str(raw).replace(",", "").strip()) if raw else 0.0
     except Exception:
@@ -244,11 +244,11 @@ def pkg_rate(pkg: dict) -> float:
 
 
 def pkg_specialty(pkg: dict) -> str:
-    return str(pkg.get("SPECIALITY", pkg.get("Speciality", "")))
+    return str(pkg.get("SPECIALITY") or pkg.get("Speciality") or pkg.get("speciality") or "")
 
 
 def pkg_category(pkg: dict) -> str:
-    return str(pkg.get("PACKAGE CATEGORY", pkg.get("PACKAGE TYPE", pkg.get("Procedure Type", ""))))
+    return str(pkg.get("PACKAGE CATEGORY") or pkg.get("PACKAGE TYPE") or pkg.get("Procedure Type") or pkg.get("procedure_type") or "")
 
 
 def pkg_implant_field(pkg: dict) -> str:
@@ -2267,6 +2267,21 @@ async def _build_final_recommendation(flow: Any, packages: list[dict]) -> dict:
             g["main_package"] = e; g["subtotal"] += rate
             result["selected_packages"].append(e)
             if not result["main_package"]: result["main_package"] = e
+        elif sel_id.startswith("variant_"):
+            v_rate = float(sel.get("rate", 0))
+            v_label = str(sel.get("label", ""))
+            if g.get("main_package"):
+                g["subtotal"] -= g["main_package"]["rate"]
+                g["main_package"]["rate"] = v_rate
+                g["main_package"]["package_category"] = v_label
+                g["subtotal"] += v_rate
+                if result["main_package"] and result["main_package"]["code"] == sel_code:
+                    result["main_package"]["rate"] = v_rate
+                    result["main_package"]["package_category"] = v_label
+                for sp in result["selected_packages"]:
+                    if sp["code"] == sel_code:
+                        sp["rate"] = v_rate
+                        sp["package_category"] = v_label
         elif sel_id.startswith("implant_") and sel_code != "NO_IMPLANT":
             g["implant_packages"].append(e); g["subtotal"] += rate
             result["implant_packages"].append(e)
