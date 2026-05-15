@@ -87,6 +87,7 @@ _pending_sessions: dict[str, dict] = {}
 _interactive_flows: dict[str, Any] = {}
 _packages_cache: list[dict] = []
 _robotic_cache: list[dict] = []
+_pmjay_cache: list[dict] = []
 _all_packages_cache: list[dict] = []
 _search_index: list[dict] = []
 _spelling_vocab_cache: set[str] = set()
@@ -350,7 +351,7 @@ def _build_spelling_vocab() -> set[str]:
         return _spelling_vocab_cache
     _load_packages_cache()
     vocab: set[str] = set()
-    for pkg in (_packages_cache + _robotic_cache):
+    for pkg in _all_packages_cache:
         blob = " ".join([
             pkg_name(pkg), pkg_specialty(pkg), pkg_category(pkg),
             str(pkg.get("Procedure Sub Category", "")),
@@ -411,13 +412,13 @@ def _correct_query_terms_spelling(raw_terms: list[str]) -> tuple[list[str], dict
 # ═══════════════════════════════════════════════════════════════════════
 
 def _load_packages_cache():
-    global _packages_cache, _robotic_cache, _all_packages_cache, _search_index
-    if _packages_cache and _robotic_cache:
+    global _packages_cache, _robotic_cache, _pmjay_cache, _all_packages_cache, _search_index
+    if _all_packages_cache:
         return
 
     from config.settings import BASE_DIR
 
-    def _load_json(filename: str) -> list[dict]:
+    def _load_json(filename: str, source_label: str) -> list[dict]:
         for candidate in [
             BASE_DIR.parent / "assets" / filename,
             BASE_DIR / "assets" / filename,
@@ -427,6 +428,8 @@ def _load_packages_cache():
                 if candidate.exists():
                     with open(candidate, "r", encoding="utf-8-sig") as f:
                         data = json.load(f)
+                    for pkg in data:
+                        pkg["_source"] = source_label
                     logger.info("Loaded %d entries from %s", len(data), candidate)
                     return data
             except Exception as exc:
@@ -434,10 +437,11 @@ def _load_packages_cache():
         logger.warning("Could not locate %s", filename)
         return []
 
-    _packages_cache = _load_json("maa_packages.json")
-    _robotic_cache = _load_json("maa_robotic_surgeries.json")
-    _all_packages_cache = _packages_cache + _robotic_cache
-    logger.info("Package cache: %d standard + %d robotic", len(_packages_cache), len(_robotic_cache))
+    _packages_cache = _load_json("maa_packages.json", "maa")
+    _robotic_cache = _load_json("maa_robotic_surgeries.json", "maa")
+    _pmjay_cache = _load_json("PMJAY_flattened.json", "pmjay")
+    _all_packages_cache = _packages_cache + _robotic_cache + _pmjay_cache
+    logger.info("Package cache: %d standard + %d robotic + %d PMJAY", len(_packages_cache), len(_robotic_cache), len(_pmjay_cache))
 
     # Pre-compute search index — normalise text/tokens ONCE for all packages
     _search_index = []
@@ -478,11 +482,18 @@ def _identify_package_type(pkg: dict) -> dict[str, bool]:
         "is_addon":              any(s in name_upper or s in cat_upper for s in ("[ADD-ON", "[ADD ON", "ADDON", "ADD-ON", "ADD ON")),
         "is_implant":            ("IMPLANT" in implant_upper and "NO IMPLANT" not in implant_upper) or cat_upper == "IMP",
         "is_extended_los":       "EXTENDED LOS" in name_upper,
+        "source":                pkg.get("_source", "maa"),
     }
 
 
 def _validate_package_combination(main_type: dict[str, bool], candidate_type: dict[str, bool], candidate_code: str) -> str | None:
     """Return violation message or None if combination is valid."""
+    main_src = main_type.get("source", "maa")
+    cand_src = candidate_type.get("source", "maa")
+    if main_src != cand_src:
+        src_map = {"maa": "MAA Yojana", "pmjay": "PMJAY"}
+        return f"Rule 6 VIOLATION: Cannot combine {src_map.get(main_src, main_src)} package with {src_map.get(cand_src, cand_src)} package ({candidate_code})"
+    
     if candidate_type["is_standalone"]:
         return f"Rule 2 VIOLATION: {candidate_code} is Stand-alone – cannot combine"
     if main_type["is_standalone"]:
@@ -884,7 +895,7 @@ def _is_transfusion_term(term: str) -> bool:
 
 def _build_raw_package_row(pkg: dict, ai_selected: bool = False) -> dict:
     return {"code": pkg_code(pkg), "name": pkg_name(pkg), "rate": pkg_rate(pkg),
-            "speciality": pkg_specialty(pkg), "ai_selected": ai_selected}
+            "speciality": pkg_specialty(pkg), "ai_selected": ai_selected, "source": pkg.get("_source", "maa")}
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1154,6 +1165,7 @@ class InteractiveSearchStartRequest(BaseModel):
     patient_age: int = 0
     patient_gender: str = ""
     patient_type: str = ""
+    scheme: str = ""  # 'maa', 'pmjay', or '' for all
 
 
 class InteractiveSearchStartResponse(BaseModel):
@@ -1820,6 +1832,13 @@ Return ONLY approved-likely packages."""
 # ROUTES: INTERACTIVE MULTI-STEP SEARCH
 # ═══════════════════════════════════════════════════════════════════════
 
+def _filter_by_scheme(pkgs: list[dict], scheme: str) -> list[dict]:
+    """Filter packages by scheme: 'maa', 'pmjay', or '' for all."""
+    if not scheme:
+        return pkgs
+    return [p for p in pkgs if p.get("_source", "maa") == scheme]
+
+
 async def _get_or_reconstruct_flow(session_id: str) -> tuple[Any, list[dict], dict]:
     from memory.sqlite_store import AgentMemory
     from tools.smart_search_flow import reconstruct_flow_from_state
@@ -1836,34 +1855,37 @@ async def _get_or_reconstruct_flow(session_id: str) -> tuple[Any, list[dict], di
     addon_terms = data.get("addon_terms", [])
     sels = data.get("selections_list", [])
     pt_type = data.get("patient_type", "")
+    scheme = data.get("scheme", "")
 
     _load_packages_cache()
-    all_pkgs = _packages_cache + _robotic_cache
+    all_pkgs = _filter_by_scheme(_all_packages_cache, scheme)
     if pt_type:
         all_pkgs = [p for p in all_pkgs if _passes_patient_type(p, pt_type)]
         
     matching = _prioritize_exact_main_term_first(_search_packages_basic(query, 200, patient_type=pt_type), query)
+    matching = _filter_by_scheme(matching, scheme)
     per_term: dict[str, list] = {query: matching}
     for t in addon_terms:
-        per_term[t] = _prioritize_exact_main_term_first(_search_packages_basic(t, 200, patient_type=pt_type), t)
+        tp = _prioritize_exact_main_term_first(_search_packages_basic(t, 200, patient_type=pt_type), t)
+        per_term[t] = _filter_by_scheme(tp, scheme)
 
     flow = reconstruct_flow_from_state(query=query, addon_terms=addon_terms, selections=sels,
                                        matching_packages=matching, all_packages=all_pkgs, per_term_packages=per_term)
     _interactive_flows[session_id] = {
         "flow": flow, "packages": matching, "all_packages": all_pkgs,
         "per_term_packages": per_term, "created_at": time.time(), "selections_list": sels,
-        "request": {"query": query, "patient_type": pt_type},
+        "request": {"query": query, "patient_type": pt_type, "scheme": scheme},
     }
     return flow, all_pkgs, per_term
 
 
-def _sync_session_db(session_id: str, flow: Any, sels: list[dict], pt_type: str = ""):
+def _sync_session_db(session_id: str, flow: Any, sels: list[dict], pt_type: str = "", scheme: str = ""):
     try:
         from memory.sqlite_store import AgentMemory
         AgentMemory().save_session(session_id, "interactive_search", {
             "query": flow.query, "addon_terms": [t for t in flow.parsed_terms if t != flow.query],
             "selections_list": sels, "flow_complete": flow.flow_complete,
-            "patient_type": pt_type,
+            "patient_type": pt_type, "scheme": scheme,
         })
     except Exception as e:
         logger.error("Failed to sync session: %s", e)
@@ -1876,12 +1898,29 @@ async def _extract_keywords_from_history(query: str) -> dict:
             "keywords": [query],
             "patient_type": _detect_patient_type_from_text(query),
         }
+    # Build a dynamic list of valid specialties + procedure keywords from loaded packages
+    _load_packages_cache()
+    specialty_names = sorted({pkg_specialty(p).strip() for p in _all_packages_cache if pkg_specialty(p).strip()})
+    # Extract unique short procedure keywords from package names (first 60 chars) for reference
+    procedure_sample = set()
+    for p in _all_packages_cache:
+        name = pkg_name(p).strip()
+        if name:
+            # Take up to first pipe or newline as the procedure label
+            short = name.split("|")[0].split("\n")[0].strip()[:80]
+            if short:
+                procedure_sample.add(short)
+    # Limit to ~120 most common procedure names to keep prompt manageable
+    procedure_names_list = sorted(procedure_sample)[:120]
+    specialties_str = ", ".join(specialty_names)
+    procedures_str = ", ".join(procedure_names_list)
 
     prompt = f"""You are a PMJAY/MAA Yojana package keyword extractor. Think like a treating doctor.
+The system contains packages from BOTH MAA Yojana (Gujarat state) and PMJAY (Ayushman Bharat national) schemes.
 
 TASK: 
 1. Generate a brief 2-5 word clinical summary of the patient's condition.
-2. Convert user input into EXACT medical package name keywords.
+2. Convert user input into EXACT medical package name keywords that match packages in our database.
 3. Write brief instructions for the PMJAY MSSO operator (e.g., "Admit under Cardiology, book PTCA").
 
 CRITICAL RULES:
@@ -1889,8 +1928,11 @@ CRITICAL RULES:
 2. If the user mentions multiple conditions (e.g., "heart attack and kidney stone"), return ONE package keyword for the first, and ONE for the second.
 3. If the user's input is a layman term (e.g. "heart attack"), translate it to medical terminology. If the user's input is ALREADY a valid medical diagnosis or procedure (e.g. "Anemia", "Sepsis", "Appendectomy"), keep it exactly as-is. NEVER force a diagnosis to become a treatment (e.g., do NOT translate "Anemia" into "Blood Transfusion").
 
-VALID PACKAGE NAMES:
-Coronary Artery Bypass Grafting, PTCA, Coronary Angiography, Pacemaker Implantation, Congestive heart failure, Systemic Thrombolysis, Appendicectomy, Cholecystectomy, Hernia, Colostomy, Thyroidectomy, Splenectomy, Exploratory Laparotomy, Total Hip Replacement, Total Knee Replacement, Fracture, Arthroscopic Meniscus Repair, Craniotomy, Acute Ischemic Stroke, Mastectomy, Nephrectomy, Nephrolithotomy, Ureteroscopy, Hysterectomy, Caesarean Section, TURP, TURBT, Cataract Surgery, Tonsillectomy, Septoplasty, Cochlear Implant, ERCP, Thermal burns, Electrical contact burns, Blood Transfusion, ICU, NPWT, Sepsis, Anemia, PCNL
+AVAILABLE SPECIALTIES:
+{specialties_str}
+
+SAMPLE PACKAGE/PROCEDURE NAMES (use these as reference for keyword extraction):
+{procedures_str}
 
 EXAMPLES:
 "heart attack" → {{"summary": "Acute Myocardial Infarction", "msso_instructions": "Admit under Cardiology. Book PTCA package.", "keywords": ["PTCA"], "patient_type": "Adult"}}
@@ -1999,19 +2041,23 @@ async def start_interactive_search(request: InteractiveSearchStartRequest):
         main_term = terms[0]
         addon_terms = terms[1:]
         pt_type = request.patient_type
+        scheme = request.scheme  # 'maa', 'pmjay', or ''
 
         matching = _prioritize_exact_main_term_first(_search_packages_basic(main_term, 200, patient_type=pt_type), main_term)
+        matching = _filter_by_scheme(matching, scheme)
         if request.disease:
             seen = {pkg_code(p) for p in matching}
-            for p in _search_packages_basic(request.disease, 120, patient_type=pt_type):
+            disease_pkgs = _filter_by_scheme(_search_packages_basic(request.disease, 120, patient_type=pt_type), scheme)
+            for p in disease_pkgs:
                 if pkg_code(p) not in seen:
                     matching.append(p)
 
         if not matching:
             _load_packages_cache()
-            all_pkgs = _packages_cache + _robotic_cache
+            all_pkgs = _filter_by_scheme(_all_packages_cache, scheme)
             if not all_pkgs:
-                raise HTTPException(503, "Package datasets not loaded.")
+                scheme_label = {"maa": "MAA Yojana", "pmjay": "PMJAY"}.get(scheme, "any scheme")
+                raise HTTPException(503, f"No packages loaded for {scheme_label}.")
             specs = get_specialties_for_term(main_term)
             if specs:
                 seen_c: set[str] = set()
@@ -2024,10 +2070,11 @@ async def start_interactive_search(request: InteractiveSearchStartRequest):
                 matching = matching[:250]
 
         if not matching:
-            raise HTTPException(404, f"No packages found for: {main_term}")
+            scheme_label = {"maa": "MAA Yojana", "pmjay": "PMJAY"}.get(scheme, "")
+            raise HTTPException(404, f"No {scheme_label} packages found for: {main_term}".strip())
 
         _load_packages_cache()
-        all_pkgs = _packages_cache + _robotic_cache
+        all_pkgs = _filter_by_scheme(_all_packages_cache, scheme)
         # ── Apply patient-type filter to the entire pool ──
         if pt_type:
             all_pkgs = [p for p in all_pkgs if _passes_patient_type(p, pt_type)]
@@ -2035,6 +2082,7 @@ async def start_interactive_search(request: InteractiveSearchStartRequest):
         per_term: dict[str, list] = {main_term: matching}
         for t in addon_terms:
             tp = _prioritize_exact_main_term_first(_search_packages_basic(t, 200, patient_type=pt_type), t)
+            tp = _filter_by_scheme(tp, scheme)
             if not tp:
                 tl = t.lower()
                 toks = [tok for tok in _tokenize(tl) if len(tok) > 2]
@@ -2063,9 +2111,9 @@ async def start_interactive_search(request: InteractiveSearchStartRequest):
             "request": {"query": request.query, "procedure": request.procedure,
                          "disease": request.disease, "symptoms": request.symptoms,
                          "patient_age": request.patient_age, "patient_gender": request.patient_gender,
-                         "patient_type": pt_type},
+                         "patient_type": pt_type, "scheme": scheme},
         }
-        _sync_session_db(sid, flow, [], pt_type=pt_type)
+        _sync_session_db(sid, flow, [], pt_type=pt_type, scheme=scheme)
 
         first = flow.steps[flow.current_step] if flow.steps and flow.current_step < len(flow.steps) else None
         if not first:

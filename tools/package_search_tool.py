@@ -60,6 +60,18 @@ def _load_robotic_surgeries() -> list[dict[str, Any]]:
     logger.info(f"Loaded {len(data)} robotic surgery packages from {ROBOTIC_JSON}")
     return data
 
+@lru_cache(maxsize=1)
+def _load_pmjay_packages() -> list[dict[str, Any]]:
+    """Load PMJAY_flattened.json once and cache in memory."""
+    PMJAY_JSON = PACKAGES_JSON.parent / "PMJAY_flattened.json"
+    if not PMJAY_JSON.exists():
+        logger.warning(f"PMJAY_flattened.json not found at {PMJAY_JSON}")
+        return []
+    with open(PMJAY_JSON, encoding="utf-8") as f:
+        data = json.load(f)
+    logger.info(f"Loaded {len(data)} PMJAY packages from {PMJAY_JSON}")
+    return data
+
 
 # ── Classification ────────────────────────────────────────────────────
 def _classify_package(pkg: dict[str, Any], source: str) -> str:
@@ -99,7 +111,7 @@ def _classify_package(pkg: dict[str, Any], source: str) -> str:
 
 def _has_linked_implants(pkg: dict[str, Any], source: str) -> bool:
     """Check if a package has linked implant packages."""
-    if source == "pmjay":
+    if source in ("maa", "pmjay"):
         implant = (pkg.get("IMPLANT PACKAGE") or "").strip()
         return implant != "" and implant.upper() != "NO IMPLANT"
     return False
@@ -307,13 +319,14 @@ def search_packages(
     # Fallback to basic token-based search
     packages = _load_packages()
     robotic = _load_robotic_surgeries()
+    pmjay_packages = _load_pmjay_packages()
     empty: dict[str, Any] = {
         "primary_packages": [], "addon_packages": [],
         "implant_packages": [], "warnings": [],
         "removed_packages": [], "total_matched": 0,
     }
 
-    if not packages and not robotic:
+    if not packages and not robotic and not pmjay_packages:
         return empty
 
     query = f"{diagnosis} {speciality} {extra_keywords} {surgery_name} {procedure_name}"
@@ -326,11 +339,15 @@ def search_packages(
     for pkg in packages:
         s = _score_package(pkg, query_tokens)
         if s > 0:
-            scored.append((s, pkg, "pmjay"))
+            scored.append((s, pkg, "maa"))
     for pkg in robotic:
         s = _score_package(pkg, query_tokens)
         if s > 0:
             scored.append((s, pkg, "robotic"))
+    for pkg in pmjay_packages:
+        s = _score_package(pkg, query_tokens)
+        if s > 0:
+            scored.append((s, pkg, "pmjay"))
 
     scored.sort(key=lambda x: x[0], reverse=True)
 
@@ -345,9 +362,10 @@ def search_packages(
             continue
         seen.add(code)
 
-        if source == "pmjay":
+        if source in ("pmjay", "maa"):
+            source_label = "PMJAY Package" if source == "pmjay" else "MAA YOJANA Package"
             entry: dict[str, Any] = {
-                "source": "MAA YOJANA Package",
+                "source": source_label,
                 "package_code": pkg.get("PACKAGE CODE", ""),
                 "package_name": pkg.get("PACKAGE NAME", "").replace("\\n", " ").strip(),
                 "speciality": pkg.get("SPECIALITY", ""),
