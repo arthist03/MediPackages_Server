@@ -975,27 +975,29 @@ def build_search_flow(
                 consolidated_addons.append(opt)
                 seen.add(code)
 
-    # Always include the Supportive Care step
-    final_options = [{
+    # Clean up consolidated addons to exclude skip/manual if they somehow got in
+    cleaned_addons = [o for o in consolidated_addons if o.get("id") not in ("addon_skip", "manual_add_addon")]
+
+    final_options = cleaned_addons[:8]
+    
+    # Always include the Supportive Care step and Manual Add
+    final_options.append({
         "id": "addon_skip",
         "code": "",
         "label": "Skip Supportive Care",
         "description": "None of these are required for this clinical case. Advance to results.",
         "specialty": "Optional",
         "rate": 0,
-        "rank": 0,
+        "rank": 9998,
         "reason": "User choice to skip supportive add-ons"
-    }]
-    if consolidated_addons:
-        final_options.extend(consolidated_addons[:9])
-        
+    })
     final_options.append({
         "id": "manual_add_addon",
         "code": "",
         "label": "Add Add-on Manually from Normal Search",
         "description": "Open normal search, select required add-on, and continue smart flow.",
         "specialty": "Manual",
-        "rate": None,
+        "rate": 0,
         "rank": 9999,
         "reason": "Use when required add-on is not listed",
     })
