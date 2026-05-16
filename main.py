@@ -1103,6 +1103,8 @@ class SmartSearchRequest(BaseModel):
     symptoms: list[str] = []
     patient_age: int = 0
     patient_gender: str = ""
+    patient_type: str = ""
+    scheme: str = ""
     limit: int = 50
 
 
@@ -1580,7 +1582,15 @@ async def smart_search(request: SmartSearchRequest):
 
     combined = ", ".join([main_term, *addon_terms]).strip(", ")
     if not combined:
-        return SmartSearchResponse(doctor_reasoning="Please provide a procedure, disease, or query.", raw_packages=[])
+        _load_packages_cache()
+        scheme_pkgs = _filter_by_scheme(_all_packages_cache, getattr(request, "scheme", ""))
+        pt_type = getattr(request, "patient_type", "")
+        if pt_type:
+            scheme_pkgs = [p for p in scheme_pkgs if _passes_patient_type(p, pt_type)]
+        
+        limit = max(25, min(100, request.limit))
+        raw = [_build_raw_package_row(p) for p in scheme_pkgs[:limit]]
+        return SmartSearchResponse(doctor_reasoning="Showing available packages.", raw_packages=raw)
 
     # Clinical pathway hints
     clinical_hint = ""
@@ -1595,12 +1605,14 @@ async def smart_search(request: SmartSearchRequest):
 
     limit = max(25, min(100, request.limit))
     relevant = _search_packages_basic(main_term, limit=limit, patient_type=request.patient_type if hasattr(request, 'patient_type') else "")
+    relevant = _filter_by_scheme(relevant, getattr(request, "scheme", ""))
     relevant = _prioritize_exact_main_term_first(relevant, main_term)
 
     addon_pkgs: list[dict] = []
     addon_by_term: dict[str, list[dict]] = {}
     for at in addon_terms:
         res = _search_packages_basic(at, limit=30, patient_type=request.patient_type if hasattr(request, 'patient_type') else "")
+        res = _filter_by_scheme(res, getattr(request, "scheme", ""))
         addon_by_term[at] = res
         addon_pkgs.extend(res)
 
@@ -1836,7 +1848,8 @@ def _filter_by_scheme(pkgs: list[dict], scheme: str) -> list[dict]:
     """Filter packages by scheme: 'maa', 'pmjay', or '' for all."""
     if not scheme:
         return pkgs
-    return [p for p in pkgs if p.get("_source", "maa") == scheme]
+    scheme_lower = scheme.lower()
+    return [p for p in pkgs if p.get("_source", "maa").lower() == scheme_lower]
 
 
 async def _get_or_reconstruct_flow(session_id: str) -> tuple[Any, list[dict], dict]:
