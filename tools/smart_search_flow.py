@@ -43,7 +43,8 @@ _GENERIC_TERMS = {"surgery", "surgical", "procedure", "operation", "management",
                   "transplant", "transplantation", "bypass", "excision", "biopsy", 
                   "incision", "graft", "implant", "resection", "scan", "xray", 
                   "ultrasound", "mri", "ct", "test", "angiography", "stent", 
-                  "disease", "syndrome", "disorder", "acute", "chronic", "severe", "mild"}
+                  "disease", "syndrome", "disorder", "acute", "chronic", "severe", "mild",
+                  "total", "partial", "bilateral", "unilateral", "complete", "primary"}
 
 _SURGICAL_KEYWORDS_RE = re.compile(
     r'(?:surgical|surgery|operative|ectomy|plasty|otomy|procedure)', re.IGNORECASE
@@ -757,7 +758,8 @@ def generate_addon_options(
         fallback_terms = [
             "icu", "care", "conservative", "management", "report", "investigation", 
             "stay", "ward", "day", "diagnostic", "imaging", "central line", 
-            "blood", "transfusion", "los", "extended", "biopsies", "serology", "thrombolysis"
+            "blood", "transfusion", "los", "extended", "biopsies", "serology", "thrombolysis",
+            "test", "pre operative", "post operative", "pre-operative", "post-operative"
         ]
         for pkg in packages:
             code = _get_pkg_code(pkg)
@@ -1000,8 +1002,8 @@ def build_search_flow(
 
     flow.add_step(SearchStep(
         step_number=len(flow.steps) + 1,
-        step_name="Supportive Care & Add-ons",
-        description="Related packages, supportive care, and pre/post-procedure options based on your selections:",
+        step_name="Select Diagnostics & Supportive Care",
+        description="Select any necessary pre-procedure diagnostics, blood components, or post-operative stay packages (ICU/Ward) required for this patient. You can skip this if none are needed.",
         options=final_options,
         requires_user_selection=True,
         context={"is_consolidated_addons": True}
@@ -1156,8 +1158,8 @@ def process_step_selection(
                     
                     flow.steps.insert(insert_idx, SearchStep(
                         step_number=insert_idx + 1,
-                        step_name=f"Select Variant for {intent_term.title()}",
-                        description="This PMJAY procedure has multiple rate variants (e.g. Insurer vs Trust). Please select the correct one:",
+                        step_name=f"Select Hospital/Rate Variant for {intent_term.title()}",
+                        description="This procedure has different rates based on hospital type (e.g., Public vs Private, NABH vs Non-NABH). Please select the appropriate variant:",
                         options=variant_options,
                         requires_user_selection=True,
                         context={"main_package": pkg_code, "intent_term": intent_term, "is_variant_selection": True},
@@ -1169,8 +1171,8 @@ def process_step_selection(
             if strat_options:
                 flow.steps.insert(insert_idx, SearchStep(
                     step_number=insert_idx + 1,
-                    step_name=f"Stratification for {intent_term.title()}",
-                    description="This package has stratification options. Select one if applicable:",
+                    step_name=f"Select Procedure Method/Stratification for {intent_term.title()}",
+                    description="This package requires you to specify the clinical method, approach, or severity (Stratification). Please select the correct option:",
                     options=strat_options,
                     requires_user_selection=True,
                     context={"main_package": pkg_code, "intent_term": intent_term},
@@ -1181,8 +1183,8 @@ def process_step_selection(
             if implant_options:
                 flow.steps.insert(insert_idx, SearchStep(
                     step_number=insert_idx + 1,
-                    step_name=f"Implant for {intent_term.title()}",
-                    description="This procedure may require an implant. Select one:",
+                    step_name=f"Select Implant for {intent_term.title()}",
+                    description="This surgical procedure may require an implant. Please select the appropriate implant package, or skip if not required:",
                     options=implant_options,
                     requires_user_selection=True,
                     context={"main_package": pkg_code, "intent_term": intent_term},
