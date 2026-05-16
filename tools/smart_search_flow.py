@@ -100,23 +100,27 @@ def _get_pkg_field(pkg: Dict[str, Any], fields: List[str], default: Any = "") ->
 
 
 def _get_pkg_name(pkg: Dict[str, Any]) -> str:
-    return str(_get_pkg_field(pkg, ["PACKAGE NAME", "Package Name"], ""))
+    return str(_get_pkg_field(pkg, ["PACKAGE NAME", "Package Name", "package_name"], ""))
+
+
+def _get_pkg_code(pkg: Dict[str, Any]) -> str:
+    return str(_get_pkg_field(pkg, ["PACKAGE CODE", "Package Code", "package_code"], ""))
 
 
 def _get_pkg_rate(pkg: Dict[str, Any]) -> float:
     try:
-        val = _get_pkg_field(pkg, ["RATE", "Rate"], 0)
+        val = _get_pkg_field(pkg, ["RATE", "Rate", "package_amount"], 0)
         return float(str(val).replace(",", "").strip()) if val else 0.0
     except Exception:
         return 0.0
 
 
 def _get_pkg_spec(pkg: Dict[str, Any]) -> str:
-    return str(_get_pkg_field(pkg, ["SPECIALITY", "Speciality", "SPECIALITY NAME"], ""))
+    return str(_get_pkg_field(pkg, ["SPECIALITY", "Speciality", "SPECIALITY NAME", "speciality"], ""))
 
 
 def _get_pkg_cat(pkg: Dict[str, Any]) -> str:
-    return str(_get_pkg_field(pkg, ["PACKAGE CATEGORY", "PACKAGE TYPE", "Procedure Type"], ""))
+    return str(_get_pkg_field(pkg, ["PACKAGE CATEGORY", "PACKAGE TYPE", "Procedure Type", "procedure_type"], ""))
 
 
 class SearchStep:
@@ -272,7 +276,7 @@ def generate_procedure_options(main_term: str, packages: List[Dict[str, Any]]) -
                     "label": spec.title(),
                     "description": f"Specialty approach: {spec.title()}",
                     "specialty": spec,
-                    "related_packages": [f"{pkg.get('PACKAGE CODE', '')}: {pkg.get('PACKAGE NAME', '')[:80]}"],
+                    "related_packages": [f"{_get_pkg_code(pkg)}: {_get_pkg_name(pkg)[:80]}"],
                     "reasoning": "Most appropriate specialty for this condition",
                 })
                 if len(options) >= 5:
@@ -455,7 +459,7 @@ def generate_package_options(
     ranked = sorted(
         matching_packages[:350],
         key=lambda p: relevance_score((
-            str(p.get("PACKAGE CODE", "")),
+            _get_pkg_code(p),
             _get_pkg_name(p),
             _get_pkg_spec(p),
             _get_pkg_cat(p)
@@ -464,7 +468,7 @@ def generate_package_options(
     )
 
     for pkg in ranked:
-        code = str(pkg.get("PACKAGE CODE", "")).strip()
+        code = _get_pkg_code(pkg).strip()
         if not code or code in seen_codes:
             continue
 
@@ -555,7 +559,7 @@ def generate_implant_options(main_package: Dict[str, Any], packages: List[Dict[s
         if not ("IMPLANT" in cat or cat == "IMP" or any(k in name for k in ("IMPLANT", "STENT", "VALVE", "PACEMAKER", "PROSTHESIS"))):
             continue
 
-        implant_code = str(pkg.get("PACKAGE CODE", "")).strip()
+        implant_code = _get_pkg_code(pkg).strip()
         if not implant_code:
             continue
         rate = _get_pkg_rate(pkg)
@@ -571,7 +575,7 @@ def generate_implant_options(main_package: Dict[str, Any], packages: List[Dict[s
             "label": name[:80],
             "description": clean_subpackage_description(name, "", rate),
             "rate": rate,
-            "base_package_code": main_package.get("PACKAGE CODE", ""),
+            "base_package_code": _get_pkg_code(main_package),
             "type": "mandatory_with_procedure" if rate > 50000 else "optional",
         }))
 
@@ -613,13 +617,13 @@ def generate_stratification_options(main_package: Dict[str, Any], packages: List
     if not main_strat or main_strat.upper() in {"NO STRATIFICATION", "REGULAR", "REGULAR PKG", "NA", "N/A", "NONE", "NULL"}:
         return []
 
-    main_code = str(main_package.get("PACKAGE CODE", "")).strip()
+    main_code = _get_pkg_code(main_package).strip()
     main_spec_n = _normalize(_get_pkg_spec(main_package))
     strat_tokens = _get_token_set(main_strat)
 
     seen = set()
     for pkg in packages:
-        code = str(pkg.get("PACKAGE CODE", "")).strip()
+        code = _get_pkg_code(pkg).strip()
         if not code or code == main_code or code in seen:
             continue
         candidate_strat = str(_get_pkg_field(pkg, ["PACKAGE STRATIFICATION", "STRATIFICATION PACKAGE", "Procedure Type"], "") or "").strip()
@@ -638,7 +642,7 @@ def generate_stratification_options(main_package: Dict[str, Any], packages: List
             "code": code,
             "label": pkg_name[:90],
             "description": clean_subpackage_description(candidate_strat, pkg_name, pkg_rate),
-            "specialty": str(pkg.get("SPECIALITY", "")),
+            "specialty": _get_pkg_spec(pkg),
             "rate": pkg_rate,
             "rank": len(options) + 1,
             "reason": f"Stratification option for selected main package ({main_strat})",
@@ -726,7 +730,7 @@ def generate_addon_options(
 
     # Find related addon matches (single pass)
     for pkg in packages:
-        code = pkg.get("PACKAGE CODE", "")
+        code = _get_pkg_code(pkg)
         if not code or code in seen_codes:
             continue
         pkg_name_n = _normalize(_get_pkg_name(pkg))
@@ -756,21 +760,21 @@ def generate_addon_options(
             "blood", "transfusion", "los", "extended", "biopsies", "serology", "thrombolysis"
         ]
         for pkg in packages:
-            code = pkg.get("PACKAGE CODE", "")
+            code = _get_pkg_code(pkg)
             if not code or code in seen_codes:
                 continue
-            spec = pkg.get("SPECIALITY", "").strip()
+            spec = _get_pkg_spec(pkg).strip()
             if spec in base_specs:
-                pkg_name_n = _normalize(str(pkg.get("PACKAGE NAME", "")))
-                pkg_cat_n = _normalize(str(pkg.get("PACKAGE CATEGORY", "")))
+                pkg_name_n = _normalize(_get_pkg_name(pkg))
+                pkg_cat_n = _normalize(_get_pkg_cat(pkg))
                 if any(kw in pkg_name_n or kw in pkg_cat_n for kw in fallback_terms) and _is_addon_package(pkg):
                     options.append({
                         "id": f"addon_{code}",
                         "code": code,
-                        "label": str(pkg.get("PACKAGE NAME", ""))[:80],
-                        "description": str(pkg.get("PACKAGE NAME", "")),
-                        "specialty": str(pkg.get("SPECIALITY", "")),
-                        "rate": pkg.get("RATE", 0),
+                        "label": _get_pkg_name(pkg)[:80],
+                        "description": _get_pkg_name(pkg),
+                        "specialty": _get_pkg_spec(pkg),
+                        "rate": _get_pkg_rate(pkg),
                         "rank": len(options) + 1,
                         "reason": f"Related Procedure/Report for {spec}",
                     })
