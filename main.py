@@ -54,6 +54,7 @@ import uvicorn
 from config.settings import (
     MAX_UPLOAD_MB, SERVER_HOST, SERVER_PORT, SERVER_WORKERS, LOG_LEVEL,
     GROQ_API_KEY, GROQ_MODEL, API_AUTH_TOKEN, CORS_ORIGINS, CORS_ALLOW_CREDENTIALS,
+    DEEPSEEK_API_KEY, DEEPSEEK_MODEL,
     TRUSTED_HOSTS, ENABLE_DOCS, APP_ENV,
 )
 from tools.medical_knowledge import (
@@ -83,6 +84,7 @@ SESSION_TTL_SECONDS = 3600
 _pipeline = None
 _groq_client: Groq | None = None
 _async_groq_client: AsyncGroq | None = None
+_async_deepseek_client = None
 _pending_sessions: dict[str, dict] = {}
 _interactive_flows: dict[str, Any] = {}
 _packages_cache: list[dict] = []
@@ -372,6 +374,22 @@ def _correct_query_terms_spelling(raw_terms: list[str]) -> tuple[list[str], dict
     corrections: dict[str, str] = {}
     corrected: list[str] = []
 
+    synonyms_map = {
+        "appendectomy": "appendicectomy",
+        "laproscpic": "lap",
+        "laproscopic": "lap",
+        "laparoscopy": "lap",
+        "laparoscopic": "lap",
+        "cholesistectomy": "cholecystectomy",
+        "cholecystectemy": "cholecystectomy",
+        "cholecistectomy": "cholecystectomy",
+        "hernea": "hernia",
+        "harnial": "hernia",
+        "hysterectemy": "hysterectomy",
+        "thyroidectemy": "thyroidectomy",
+        "mastectemy": "mastectomy",
+    }
+
     for term in raw_terms:
         original = (term or "").strip()
         if not original:
@@ -384,13 +402,18 @@ def _correct_query_terms_spelling(raw_terms: list[str]) -> tuple[list[str], dict
         new_tokens: list[str] = []
         changed = False
         for tok in tokens:
+            if tok in synonyms_map:
+                new_tokens.append(synonyms_map[tok])
+                changed = True
+                continue
             if len(tok) < 4 or tok.isdigit() or tok in vocab:
                 new_tokens.append(tok)
                 continue
-            candidates = difflib.get_close_matches(tok, _spelling_vocab_list_cache, n=3, cutoff=0.84)
+            filtered_vocab = [w for w in _spelling_vocab_list_cache if w.startswith(tok[0])]
+            candidates = difflib.get_close_matches(tok, filtered_vocab, n=3, cutoff=0.84)
             replacement = tok
             for c in candidates:
-                if c and c[0] == tok[0] and abs(len(c) - len(tok)) <= 2:
+                if abs(len(c) - len(tok)) <= 2:
                     replacement = c
                     break
             new_tokens.append(replacement)
@@ -535,8 +558,8 @@ def _passes_patient_type(pkg: dict, pt_type: str) -> bool:
     """Filter packages based on patient demographic (Adult vs Pediatric)."""
     if not pt_type:
         return True
-    name = str(pkg.get("PACKAGE NAME", "")).lower()
-    spec = str(pkg.get("SPECIALITY", "")).lower()
+    name = pkg_name(pkg).lower()
+    spec = pkg_specialty(pkg).lower()
     is_pedia = _is_pediatric_package(name, spec)
 
     if pt_type.lower() == "adult":
@@ -671,12 +694,40 @@ def _cached_search_packages_basic(query: str, limit: int = 50, patient_type: str
             if not related_match:
                 continue
 
-        # Coronary angioplasty refinement
-        if "angioplasty" in query_lower and "peripheral" not in query_lower:
-            if _has_term("ptca", name, name_tok) or _has_term("coronary", name, name_tok):
-                score += 16
-            if _has_term("peripheral", name, name_tok) or _has_term("peripheral", spec, spec_tok):
-                score -= 10
+        # Laparoscopic vs Open logic
+        has_lap_in_query = "lap" in filtered_terms or "laparoscopic" in query_lower or "lap" in query_lower
+        is_lap_package = "lap" in name_tok or "laparoscopic" in name.lower() or "lap." in name.lower() or "lap-" in name.lower()
+        is_open_package = "open" in name_tok or "open" in name.lower()
+        
+        if has_lap_in_query:
+            if is_lap_package:
+                score += 25
+            if is_open_package:
+                score -= 15
+        else:
+            # Open is preferred if lap is not mentioned
+            if is_lap_package:
+                score -= 25
+            if is_open_package:
+                score += 15
+
+        # Coronary PTCA vs CABG logic
+        has_ptca_in_query = "ptca" in query_lower or "angioplasty" in query_lower
+        has_cabg_in_query = "cabg" in query_lower or "bypass" in query_lower
+        is_ptca_package = "ptca" in name.lower() or "ptca" in code.lower()
+        is_cabg_package = "cabg" in name.lower() or "bypass" in name.lower()
+        
+        if has_ptca_in_query:
+            if is_ptca_package:
+                score += 40
+            if is_cabg_package:
+                score -= 60
+        
+        if has_cabg_in_query:
+            if is_cabg_package:
+                score += 40
+            if is_ptca_package:
+                score -= 60
 
         if score > 0:
             scored.append((exact_p, score, pkg))
@@ -871,6 +922,26 @@ def _check_intent_rule_violation(intents: dict[str, str]) -> str | None:
 def _split_query_terms(raw_query: str) -> list[str]:
     return [p.strip() for p in (raw_query or "").replace(";", ",").replace("|", ",").split(",") if p.strip()]
 
+def _clean_query_terms(terms: list[str]) -> list[str]:
+    import re
+    cleaned = []
+    patterns_to_remove = [
+        r'\b\d+\s*(?:yr|year|years|yo|yoa|m|months|d|days)\b',
+        r'\b(?:old|age)\b',
+        r'\b(?:female|male|boy|girl|man|woman|child|infant|neonate|baby)\b',
+        r'\b(?:patient|pt)\b',
+        r'\b(?:icu|ward|stay|days|hospital|private|public|nabh|non-nabh|room|rent|care\s*unit|underwent|followed\s*by|for|with)\b',
+    ]
+    for term in terms:
+        t_cleaned = term.lower()
+        for p in patterns_to_remove:
+            t_cleaned = re.sub(p, ' ', t_cleaned, flags=re.IGNORECASE)
+        t_cleaned = re.sub(r'\s+', ' ', t_cleaned).strip()
+        # Keep if there's at least one word > 2 characters
+        if any(len(w) > 2 for w in re.findall(r'[a-zA-Z0-9]+', t_cleaned)):
+            cleaned.append(t_cleaned)
+    return cleaned
+
 
 def _append_unique_term(target: list[str], value: str) -> None:
     val = (value or "").strip()
@@ -974,13 +1045,26 @@ async def lifespan(app: FastAPI):
         logger.error("⚠️ GROQ_API_KEY not set! https://console.groq.com/keys")
     else:
         _groq_client = Groq(api_key=GROQ_API_KEY)
-        _async_groq_client = AsyncGroq(api_key=GROQ_API_KEY)
+        _async_groq_client = AsyncGroq(api_key=GROQ_API_KEY, max_retries=1)
         logger.info("✅ Groq API keys configured — clients initialised")
 
     if not FIREBASE_SERVICE_ACCOUNT:
         logger.warning("⚠️ FIREBASE_SERVICE_ACCOUNT not set – push notifications disabled")
     else:
         logger.info("✅ Firebase Service Account configured")
+        
+    from config.settings import DEEPSEEK_API_KEY
+    if DEEPSEEK_API_KEY:
+        try:
+            from openai import AsyncOpenAI
+            global _async_deepseek_client
+            _async_deepseek_client = AsyncOpenAI(
+                api_key=DEEPSEEK_API_KEY,
+                base_url="https://api.deepseek.com"
+            )
+            logger.info("✅ DeepSeek API configured")
+        except ImportError:
+            logger.warning("⚠️ openai package not installed, DeepSeek disabled. run `pip install openai`")
 
     logger.info("🚀 Compiling LangGraph pipeline…")
     try:
@@ -1128,6 +1212,7 @@ class SmartSearchResponse(BaseModel):
     doctor_reasoning: str = ""
     raw_packages: list[dict] = []
     approval_likelihood: str = ""
+    usage: Optional[dict] = None
 
 
 class SearchOption(BaseModel):
@@ -1174,8 +1259,10 @@ class InteractiveSearchStartResponse(BaseModel):
     session_id: str
     query: str
     parsed_terms: list[str]
-    current_step: SearchStepResponse
+    current_step: Optional[SearchStepResponse] = None
     message: str
+    status: Optional[str] = "running"
+    final_recommendation: Optional[dict] = None
 
 
 class SelectionRequest(BaseModel):
@@ -1574,6 +1661,7 @@ async def smart_search(request: SmartSearchRequest):
         query_terms = _split_query_terms(expanded_query)
         query_terms, spelling_corrections = _correct_query_terms_spelling(query_terms)
 
+    query_terms = _clean_query_terms(query_terms)
     main_term = query_terms[0] if query_terms else ""
     addon_terms = query_terms[1:] if len(query_terms) > 1 else []
 
@@ -1686,6 +1774,12 @@ Return ONLY approved-likely packages."""
             doctor_reasoning=ai.get("doctor_summary", ""),
             approval_likelihood=ai.get("approval_likelihood", ""),
         )
+        if hasattr(resp, 'usage') and resp.usage:
+            result.usage = {
+                "prompt_tokens": resp.usage.prompt_tokens,
+                "completion_tokens": resp.usage.completion_tokens,
+                "total_tokens": resp.usage.total_tokens,
+            }
 
         pkg_lookup = {pkg_code(p): p for p in all_relevant}
         main_type = None
@@ -1750,16 +1844,21 @@ Return ONLY approved-likely packages."""
                         err = _validate_package_combination(main_type, at, ac)
                         if err:
                             violations.append(err)
+                            reason = f"[RULE VIOLATION] {addon.get('reason', '')} (Warning: {err})"
                         else:
-                            selected_codes.add(ac)
                             reason = addon.get("reason", "")
                             if at["is_extended_los"]: reason = f"Rule 5: Extended LOS. {reason}"
                             elif at["is_addon"]: reason = f"Rule 3: Compatible add-on. {reason}"
-                            result.suggested_addons.append(PackageResultModel(
-                                package_code=ac, package_name=pkg_name(p), rate=pkg_rate(p),
-                                speciality=pkg_specialty(p), category=pkg_category(p),
-                                is_addon=True, medical_reason=reason,
-                            ))
+                        
+                        selected_codes.add(ac)
+                        if ac not in seen:
+                            all_relevant.append(p)
+                            seen.add(ac)
+                        result.suggested_addons.append(PackageResultModel(
+                            package_code=ac, package_name=pkg_name(p), rate=pkg_rate(p),
+                            speciality=pkg_specialty(p), category=pkg_category(p),
+                            is_addon=True, medical_reason=reason,
+                        ))
                         break
 
             # Deterministic add-on fallback for user-requested terms
@@ -1772,15 +1871,22 @@ Return ONLY approved-likely packages."""
                     if err:
                         if _is_transfusion_term(at_term):
                             err = None
+                            reason = f"Clinical add-on: {at_term}"
                         else:
                             violations.append(err)
-                            continue
+                            reason = f"[RULE VIOLATION] Requested add-on: {at_term} (Warning: {err})"
+                    else:
+                        prefix = "Clinical add-on" if at_term.lower() in {"blood transfusion", "transfusion"} else "Requested add-on"
+                        reason = f"{prefix}: {at_term}"
+
                     selected_codes.add(ac)
-                    prefix = "Clinical add-on" if at_term.lower() in {"blood transfusion", "transfusion"} else "Requested add-on"
+                    if ac not in seen:
+                        all_relevant.append(p)
+                        seen.add(ac)
                     result.suggested_addons.append(PackageResultModel(
                         package_code=ac, package_name=pkg_name(p), rate=pkg_rate(p),
                         speciality=pkg_specialty(p), category=pkg_category(p),
-                        is_addon=True, medical_reason=f"{prefix}: {at_term}",
+                        is_addon=True, medical_reason=reason,
                     ))
                     break
 
@@ -1795,6 +1901,9 @@ Return ONLY approved-likely packages."""
                         ac = pkg_code(p)
                         if ac:
                             selected_codes.add(ac)
+                            if ac not in seen:
+                                all_relevant.append(p)
+                                seen.add(ac)
                             result.suggested_addons.append(PackageResultModel(
                                 package_code=ac, package_name=pkg_name(p), rate=pkg_rate(p),
                                 speciality=pkg_specialty(p), category=pkg_category(p),
@@ -1852,13 +1961,13 @@ def _filter_by_scheme(pkgs: list[dict], scheme: str) -> list[dict]:
     return [p for p in pkgs if p.get("_source", "maa").lower() == scheme_lower]
 
 
-async def _get_or_reconstruct_flow(session_id: str) -> tuple[Any, list[dict], dict]:
+async def _get_or_reconstruct_flow(session_id: str) -> tuple[Any, list[dict], list[dict], dict]:
     from memory.sqlite_store import AgentMemory
     from tools.smart_search_flow import reconstruct_flow_from_state
 
     if session_id in _interactive_flows:
         d = _interactive_flows[session_id]
-        return d["flow"], d["all_packages"], d.get("per_term_packages", {})
+        return d["flow"], d["all_packages"], d["packages"], d.get("per_term_packages", {})
 
     data = AgentMemory().get_session(session_id)
     if not data:
@@ -1889,7 +1998,7 @@ async def _get_or_reconstruct_flow(session_id: str) -> tuple[Any, list[dict], di
         "per_term_packages": per_term, "created_at": time.time(), "selections_list": sels,
         "request": {"query": query, "patient_type": pt_type, "scheme": scheme},
     }
-    return flow, all_pkgs, per_term
+    return flow, all_pkgs, matching, per_term
 
 
 def _sync_session_db(session_id: str, flow: Any, sels: list[dict], pt_type: str = "", scheme: str = ""):
@@ -1940,6 +2049,7 @@ CRITICAL RULES:
 1. ONLY return ONE package keyword per distinct medical condition. Do NOT return multiple packages for the same condition (e.g., for heart attack, pick ONLY the most appropriate primary intervention, like "PTCA" OR "Coronary Angiography", NOT both).
 2. If the user mentions multiple conditions (e.g., "heart attack and kidney stone"), return ONE package keyword for the first, and ONE for the second.
 3. If the user's input is a layman term (e.g. "heart attack"), translate it to medical terminology. If the user's input is ALREADY a valid medical diagnosis or procedure (e.g. "Anemia", "Sepsis", "Appendectomy"), keep it exactly as-is. NEVER force a diagnosis to become a treatment (e.g., do NOT translate "Anemia" into "Blood Transfusion").
+4. EXCLUDE hospital stay details, ward types, ICU stays/days, or facility tiers (e.g., "private hospital", "2 days ICU", "ward stay") from the "keywords" list. These are supportive accommodations, not primary procedures/treatments.
 
 AVAILABLE SPECIALTIES:
 {specialties_str}
@@ -2048,12 +2158,15 @@ async def start_interactive_search(request: InteractiveSearchStartRequest):
         if expanded_dis and expanded_dis not in terms:
             terms.append(expanded_dis)
         terms, corrections = _correct_query_terms_spelling(terms)
+        terms = _clean_query_terms(terms)
         if not terms:
             raise HTTPException(400, "Please provide a query, procedure, or disease")
 
         main_term = terms[0]
         addon_terms = terms[1:]
         pt_type = request.patient_type
+        if not pt_type:
+            pt_type = _detect_patient_type_from_text(request.query)
         scheme = request.scheme  # 'maa', 'pmjay', or ''
 
         matching = _prioritize_exact_main_term_first(_search_packages_basic(main_term, 200, patient_type=pt_type), main_term)
@@ -2150,10 +2263,10 @@ async def start_interactive_search(request: InteractiveSearchStartRequest):
 
 @app.get("/interactive-search/{session_id}/step")
 async def get_current_step(session_id: str):
-    flow, pkgs, _ = await _get_or_reconstruct_flow(session_id)
+    flow, all_pkgs, _, _ = await _get_or_reconstruct_flow(session_id)
     from tools.smart_search_flow import advance_past_empty_optional_steps
     advance_past_empty_optional_steps(flow)
-    _auto_advance_single_option_steps(flow, pkgs)
+    _auto_advance_single_option_steps(flow, all_pkgs)
 
     if flow.flow_complete:
         return {"status": "complete", "final_recommendation": flow.final_recommendation, "selections": flow.selections}
@@ -2166,11 +2279,11 @@ async def get_current_step(session_id: str):
 
 @app.post("/interactive-search/{session_id}/select")
 async def submit_step_selection(session_id: str, selection: SelectionRequest):
-    flow, pkgs, _ = await _get_or_reconstruct_flow(session_id)
+    flow, all_pkgs, _, _ = await _get_or_reconstruct_flow(session_id)
     from tools.smart_search_flow import process_step_selection
 
     ok, err = process_step_selection(flow, {"id": selection.option_id, "notes": selection.notes,
-                                             "manual_package": selection.manual_package}, pkgs)
+                                             "manual_package": selection.manual_package}, all_pkgs)
     if not ok:
         return SelectionResponse(success=False, message=f"Error: {err}")
 
@@ -2179,10 +2292,10 @@ async def submit_step_selection(session_id: str, selection: SelectionRequest):
     _interactive_flows[session_id]["selections_list"] = sels
     _pt = _interactive_flows.get(session_id, {}).get("request", {}).get("patient_type", "")
     _sync_session_db(session_id, flow, sels, pt_type=_pt)
-    _auto_advance_single_option_steps(flow, pkgs)
+    _auto_advance_single_option_steps(flow, all_pkgs)
 
     if flow.flow_complete:
-        final = await _build_final_recommendation(flow, pkgs)
+        final = await _build_final_recommendation(flow, all_pkgs)
         flow.final_recommendation = final
         return SelectionResponse(success=True, message="Search complete!", flow_complete=True, final_recommendation=final)
 
@@ -2194,7 +2307,7 @@ async def submit_step_selection(session_id: str, selection: SelectionRequest):
 
 @app.post("/interactive-search/{session_id}/undo")
 async def undo_step_selection(session_id: str):
-    flow, _, _ = await _get_or_reconstruct_flow(session_id)
+    flow, _, _, _ = await _get_or_reconstruct_flow(session_id)
     from tools.smart_search_flow import undo_last_selection
 
     ok, msg = undo_last_selection(flow)
@@ -2323,6 +2436,716 @@ async def _build_final_recommendation(flow: Any, packages: list[dict]) -> dict:
                 result["approval_likelihood"] = "LOW"
 
     return result
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# PRO INTERACTIVE MULTI-STEP SEARCH (DYNAMIC AI-DRIVEN)
+# ═══════════════════════════════════════════════════════════════════════
+
+class ProSelectionRequest(BaseModel):
+    option_id: str
+    notes: Optional[str] = ""
+    manual_package: Optional[Dict[str, Any]] = None
+
+async def _advance_pro_dynamic_flow(session_id: str, depth: int = 0) -> bool:
+    if depth > 3:
+        # Failsafe to prevent infinite Groq loops
+        flow, _, _, _ = await _get_or_reconstruct_flow(session_id)
+        flow.mark_complete()
+        return True
+
+    flow, _, matching_pkgs, _ = await _get_or_reconstruct_flow(session_id)
+    if not _async_groq_client:
+        return False
+        
+    pkg_summary = "\n".join([f"- [{pkg_code(p)}] {pkg_name(p)[:100]} ({pkg_specialty(p)}) | ₹{pkg_rate(p)}" for p in matching_pkgs[:30]])
+    
+    chat_history_str = f"USER INITIAL QUERY: {flow.query}\n"
+    for i, step in enumerate(flow.steps):
+        if step.user_selection:
+            opt_id = step.user_selection.get("id")
+            opt_label = str(opt_id)
+            if hasattr(step, "options"):
+                for o in step.options:
+                    o_id = o.get("id") if isinstance(o, dict) else getattr(o, "id", None)
+                    if o_id == opt_id:
+                        opt_label = o.get("label") if isinstance(o, dict) else getattr(o, "label", str(opt_id))
+                        break
+            chat_history_str += f"AI ASKED: {step.step_name} - {step.description}\n"
+            chat_history_str += f"USER SELECTED: {opt_label}\n"
+            if step.step_name == "Main Package Selected":
+                chat_history_str += f"[SYSTEM: THE MAIN PACKAGE HAS BEEN SUCCESSFULLY SELECTED. YOU MUST NOW SUGGEST ADD-ONS OR FINISH.]\n"
+    try:
+        print(f"=== CHAT HISTORY ===\n{chat_history_str}\n====================")
+    except Exception:
+        pass
+    prompt = f"""You are a PMJAY/MAA Yojana package selection AI for Pro Users.
+Your goal is to find the exact, best matching packages based on the doctor's input (history, symptoms, diagnosis) with the LEAST amount of questioning possible.
+
+Available matching packages:
+{pkg_summary}
+
+Chat History:
+{chat_history_str}
+
+
+TASK:
+1. DIRECT MATCHING FIRST: Analyze the chat history and the doctor's input. If the input strongly points to specific packages (or if there are 10 or fewer highly relevant packages), DO NOT ask any abstract questions. Immediately output action "NARROW_DOWN" and provide those EXACT packages as the options (label = package name, value = package code).
+2. ONLY ASK IF AMBIGUOUS: If there are many packages and the exact clinical path is unclear (e.g. "stomach pain" or "fracture"), ask exactly ONE targeted question to figure out the differentiating factor (e.g. body part, surgical vs medical, with/without implant). NEVER ask continuous, ambiguous questions.
+3. NEVER repeat a question that has already been asked in the chat history. If you are stuck or have already asked a question, simply present the best matching packages.
+4. MAA YOJANA RULES: Keep MAA Yojana / PMJAY business rules in mind (e.g., if a major surgery is indicated, minor related procedures shouldn't be primary; respect phase requirements for burns).
+5. If you have narrowed it down to exactly one main package, output action: "SELECT_MAIN" and provide the selected_package_code.
+6. If the chat history shows [SYSTEM: THE MAIN PACKAGE HAS BEEN SUCCESSFULLY SELECTED...], DO NOT output "SELECT_MAIN" again. Instead, ask if they need add-ons (like Blood Transfusion, ICU) or output FINISH. Output action: "SUGGEST_ADDON" and provide add-on options.
+7. If all is done (no more add-ons needed, or the user skips/declines), output action: "FINISH".
+
+CRITICAL:
+- ALWAYS include a "Skip / Continue" option if you are asking for Add-ons.
+- Output ONLY raw valid JSON matching this schema:
+{{
+  "action": "NARROW_DOWN" | "SELECT_MAIN" | "SUGGEST_ADDON" | "FINISH",
+  "question": "The question to ask the user (if just listing exact packages, set this to 'Please select the specific package:')",
+  "options": [
+      {{
+          "label": "Option label (e.g. Exact Package Name OR a category like 'Unilateral')", 
+          "value": "internal_value OR package code",
+          "description": "Brief description or specialty/rate"
+      }}
+  ],
+  "selected_package_code": "CODE" // (only if SELECT_MAIN or FINISH)
+}}
+"""
+    try:
+        content = ""
+        
+        # Try DeepSeek API first for Pro users
+        if DEEPSEEK_API_KEY and _async_deepseek_client:
+            try:
+                resp = await _async_deepseek_client.chat.completions.create(
+                    model=DEEPSEEK_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    stream=False,
+                    reasoning_effort="high",
+                    temperature=0.0,
+                    response_format={"type": "json_object"},
+                    extra_body={"thinking": {"type": "enabled"}}
+                )
+                content = resp.choices[0].message.content
+            except Exception as d_err:
+                logger.warning(f"DeepSeek request error: {d_err}")
+                
+        # Fallback to Groq
+        if not content and _async_groq_client:
+            logger.info("Falling back to Groq API...")
+            resp_groq = await _async_groq_client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                response_format={"type": "json_object"},
+            )
+            content = resp_groq.choices[0].message.content
+            
+        if not content:
+            raise ValueError("Both DeepSeek and Groq APIs failed to return content.")
+            
+        # Parse JSON
+        # Some reasoning models might output text before JSON or in a reasoning block
+        if "```json" in content:
+            content = content.split("```json")[1].split("```")[0].strip()
+        ai_res = json.loads(content)
+        action = ai_res.get("action")
+        
+        from tools.smart_search_flow import SearchStep
+        
+        if action == "FINISH":
+            flow.mark_complete()
+            return True
+            
+        elif action == "SELECT_MAIN":
+            code = ai_res.get("selected_package_code")
+            if code:
+                p_label = "Selected Package"
+                p_rate = 0
+                p_desc = ""
+                for p in matching_pkgs:
+                    if pkg_code(p) == code:
+                        p_label = pkg_name(p)
+                        p_rate = pkg_rate(p)
+                        p_desc = pkg_specialty(p)
+                        break
+                        
+                step_idx = len(flow.steps)
+                step = SearchStep(step_idx, "Main Package Selected", "AI automatically narrowed down to this package.", [
+                    {"id": f"package_{code}", "label": p_label, "description": p_desc, "rate": p_rate}
+                ])
+                flow.add_step(step)
+                flow.set_selection(step_idx, {"id": f"package_{code}"})
+                return await _advance_pro_dynamic_flow(session_id, depth=depth + 1)
+                
+        elif action in ("NARROW_DOWN", "SUGGEST_ADDON"):
+            opts = ai_res.get("options", [])
+            options_obj = []
+            for i, opt in enumerate(opts):
+                val = str(opt.get("value", f"opt_{i}"))
+                options_obj.append({
+                    "id": f"ai_opt_{val}",
+                    "label": str(opt.get("label", val)),
+                    "description": str(opt.get("description", "")),
+                    "rate": 0
+                })
+            
+            options_obj.append({
+                "id": "manual_add_skip",
+                "label": "Skip / Add Manually",
+                "description": "Skip this question",
+                "rate": 0,
+                "rank": 9999
+            })
+            
+            step_idx = len(flow.steps)
+            question_text = ai_res.get("question")
+            if not question_text or question_text.strip() == "":
+                question_text = "Please select the specific package:"
+                
+            step = SearchStep(step_idx, question_text, "", options_obj)
+            flow.add_step(step)
+            return True
+            
+    except Exception as e:
+        logger.error("Pro AI flow error: %s", e)
+        return False
+
+async def _check_query_for_choice(query: str, options: list[dict], step_type: str, client: Any) -> Optional[dict]:
+    if not client:
+        return None
+    
+    # Filter out manual/skip options so LLM focuses only on the real choices
+    filtered_options = [
+        {"id": opt.get("id"), "label": opt.get("label"), "description": opt.get("description"), "rate": opt.get("rate")}
+        for opt in options if not str(opt.get("id", "")).startswith("manual_add") and "skip" not in str(opt.get("id", "")).lower()
+    ]
+    
+    if not filtered_options:
+        return None
+        
+    options_str = json.dumps(filtered_options, indent=2)
+    
+    # Find if there is a skip option
+    skip_option = next((opt for opt in options if "skip" in str(opt.get("id", "")).lower()), None)
+    
+    prompt = f"""You are a clinical decision support system.
+The user query / clinical history is:
+"{query}"
+
+We are currently choosing an option for: "{step_type}".
+The available options are:
+{options_str}
+
+TASK:
+1. Check if the user query explicitly specifies which option is needed.
+2. If the user query indicates that NO implant, NO stratification, or NO supportive/stay packages are needed, return "skip" as the matched_id.
+3. If there is a clear clinical match or option specified, return the exact "id" of the matched option in the "matched_id" field.
+4. If none of the available options are clinically appropriate or relevant for the patient's main condition/procedure (e.g. options are for Burns/Cardiology but the patient has Appendectomy/General Surgery), return "skip" as the matched_id.
+5. If the query does NOT specify which option to select, lacks details to choose between them, or is ambiguous, return null.
+
+Return a JSON object:
+{{
+  "matched_id": "option_id" or "skip" or null,
+  "reason": "clinical matching reason"
+}}
+"""
+    try:
+        resp = await client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[{"role": "system", "content": "You are a clinical decision support system. Always respond in JSON."},
+                      {"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=300,
+            response_format={"type": "json_object"},
+        )
+        data = json.loads(resp.choices[0].message.content)
+        matched_id = data.get("matched_id")
+        if matched_id == "skip" and skip_option:
+            return skip_option
+        if matched_id:
+            for opt in options:
+                if opt.get("id") == matched_id:
+                    return opt
+    except Exception as e:
+        logger.error(f"Error in _check_query_for_choice: {e}")
+    return None
+
+async def _check_query_for_multiple_choices(query: str, options: list[dict], step_type: str, client: Any) -> list[dict]:
+    if not client:
+        return []
+    
+    filtered_options = [
+        {"id": opt.get("id"), "label": opt.get("label"), "description": opt.get("description"), "rate": opt.get("rate")}
+        for opt in options if not str(opt.get("id", "")).startswith("manual_add") and "skip" not in str(opt.get("id", "")).lower()
+    ]
+    if not filtered_options:
+        return []
+        
+    options_str = json.dumps(filtered_options, indent=2)
+    prompt = f"""You are a clinical decision support system.
+The user query / clinical history is:
+"{query}"
+
+We are selecting multiple supportive care packages / add-ons for: "{step_type}".
+The available options are:
+{options_str}
+
+TASK:
+1. Identify all options from the list that are explicitly requested or clinically required according to the user query (e.g. ICU stay, general ward stay, specific stay duration, blood transfusion, etc.).
+2. Return a list of their exact "id" values.
+3. If none of the options match the query or are clinically appropriate for the main procedure, return an empty list.
+
+Return a JSON object:
+{{
+  "matched_ids": ["id1", "id2", ...]
+}}
+"""
+    try:
+        resp = await client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[{"role": "system", "content": "You are a clinical decision support system. Always respond in JSON."},
+                      {"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=300,
+            response_format={"type": "json_object"},
+        )
+        data = json.loads(resp.choices[0].message.content)
+        matched_ids = data.get("matched_ids", [])
+        matched_options = []
+        if isinstance(matched_ids, list):
+            for m_id in matched_ids:
+                opt = next((o for o in options if o.get("id") == m_id), None)
+                if opt:
+                    matched_options.append(opt)
+            return matched_options
+    except Exception as e:
+        logger.error(f"Error in _check_query_for_multiple_choices: {e}")
+    return []
+
+@app.post("/pro-interactive-search/start", response_model=InteractiveSearchStartResponse)
+async def start_pro_interactive_search(request: InteractiveSearchStartRequest):
+    # 1. Start standard search first to get parsed_terms and session setup
+    res = await start_interactive_search(request)
+    sid = res.session_id
+    session_data = _interactive_flows[sid]
+    flow = session_data["flow"]
+
+    # 2. Invoke AI smart search to directly match packages
+    smart_req = SmartSearchRequest(
+        query=request.query,
+        procedure=request.procedure,
+        disease=request.disease,
+        symptoms=request.symptoms,
+        patient_age=request.patient_age,
+        patient_gender=request.patient_gender,
+        patient_type=request.patient_type,
+        scheme=request.scheme,
+        limit=50
+    )
+
+    smart_res = await smart_search(smart_req)
+
+    _load_packages_cache()
+    all_packages = session_data["all_packages"]
+
+    # We will keep advancing the flow programmatically until it is either complete,
+    # or we encounter a step where details are missing and we need to ask the user.
+    asked = False
+    from tools.smart_search_flow import process_step_selection
+    
+    max_iterations = 20
+    iterations = 0
+    
+    while not flow.flow_complete and iterations < max_iterations:
+        iterations += 1
+        current_step = flow.steps[flow.current_step]
+        options = current_step.options
+        
+        is_primary = current_step.context.get("is_primary_selection", False)
+        is_term = current_step.context.get("is_term_selection", False)
+        is_variant = current_step.context.get("is_variant_selection", False)
+        is_consolidated_addons = current_step.context.get("is_consolidated_addons", False)
+        
+        is_strat = any(opt["id"].startswith("strat_") for opt in options if opt["id"] not in ("strat_skip", "manual_add_strat"))
+        is_implant = any(opt["id"].startswith("implant_") for opt in options if opt["id"] not in ("implant_skip", "manual_add_implant"))
+        
+        selected_option = None
+        
+        if is_primary or is_term:
+            # For primary/term packages, match code from smart search
+            recommended_code = None
+            if is_primary:
+                recommended_code = smart_res.main_package.package_code if (smart_res and smart_res.main_package) else None
+            else:
+                # Find matching addon
+                for add in smart_res.suggested_addons:
+                    if any(opt.get("code") == add.package_code for opt in options):
+                        recommended_code = add.package_code
+                        break
+            
+            if recommended_code:
+                selected_option = next((opt for opt in options if opt.get("code") == recommended_code), None)
+            
+            # Fallback to first non-skip option if AI didn't recommend one but we don't want to stop here
+            if not selected_option and options:
+                valid_opts = [opt for opt in options if opt["id"] not in ("package_skip", "manual_add_main")]
+                if valid_opts:
+                    selected_option = valid_opts[0]
+                    
+        elif is_strat:
+            selected_option = await _check_query_for_choice(
+                query=request.query,
+                options=options,
+                step_type="stratification",
+                client=_async_groq_client
+            )
+            if not selected_option:
+                asked = True
+                break
+                
+        elif is_implant:
+            selected_option = await _check_query_for_choice(
+                query=request.query,
+                options=options,
+                step_type="implant",
+                client=_async_groq_client
+            )
+            if not selected_option:
+                asked = True
+                break
+                
+        elif is_variant:
+            selected_option = await _check_query_for_choice(
+                query=request.query,
+                options=options,
+                step_type="variant",
+                client=_async_groq_client
+            )
+            if not selected_option:
+                asked = True
+                break
+                
+        elif is_consolidated_addons:
+            matched_options = await _check_query_for_multiple_choices(
+                query=request.query,
+                options=options,
+                step_type="supportive care / stay duration",
+                client=_async_groq_client
+            )
+            if matched_options:
+                for opt in matched_options:
+                    sels = session_data.get("selections_list", [])
+                    if not any(s.get("id") == opt["id"] for s in sels):
+                        sels.append({
+                            "id": opt["id"],
+                            "notes": "Pro auto-selected",
+                            "manual_package": None
+                        })
+                        session_data["selections_list"] = sels
+                        process_step_selection(flow, opt, all_packages)
+            
+            # To advance past this step, we select the skip option
+            selected_option = next((opt for opt in options if opt["id"] == "addon_skip"), None)
+                
+        if not selected_option:
+            selected_option = next((opt for opt in options if "skip" in opt["id"]), None)
+            if not selected_option and options:
+                selected_option = options[0]
+                
+        if selected_option:
+            # Add to selections_list so frontend status works correctly
+            sels = session_data.get("selections_list", [])
+            sels.append({
+                "id": selected_option["id"],
+                "notes": "Pro auto-selected",
+                "manual_package": None
+            })
+            session_data["selections_list"] = sels
+            
+            success, err = process_step_selection(flow, selected_option, all_packages)
+            if not success:
+                asked = True
+                break
+            
+            # Sync session DB
+            _sync_session_db(sid, flow, sels, pt_type=request.patient_type)
+            _auto_advance_single_option_steps(flow, all_packages)
+        else:
+            asked = True
+            break
+
+    if asked:
+        current_step = flow.steps[flow.current_step]
+        return InteractiveSearchStartResponse(
+            session_id=sid,
+            query=res.query,
+            parsed_terms=res.parsed_terms,
+            current_step=_step_to_response(current_step),
+            message="Please provide the missing clinical details to complete selection.",
+            status="interactive",
+            final_recommendation=None
+        )
+    else:
+        final_rec_dict = await _build_final_recommendation(flow, all_packages)
+        flow.final_recommendation = final_rec_dict
+        _sync_session_db(sid, flow, session_data.get("selections_list", []), pt_type=request.patient_type, scheme=request.scheme)
+        
+        return InteractiveSearchStartResponse(
+            session_id=sid,
+            query=res.query,
+            parsed_terms=res.parsed_terms,
+            current_step=None,
+            message="AI successfully matched and selected all package details.",
+            status="complete",
+            final_recommendation=final_rec_dict
+        )
+
+class RecalculateRequest(BaseModel):
+    session_id: str
+    package_codes: list[str]
+    custom_rates: Optional[dict[str, float]] = None
+
+@app.post("/pro-interactive-search/recalculate")
+async def recalculate_pro_recommendation(req: RecalculateRequest):
+    flow, all_pkgs, _, _ = await _get_or_reconstruct_flow(req.session_id)
+    if not flow:
+        raise HTTPException(404, "Session not found.")
+        
+    _load_packages_cache()
+    def get_full_package(code: str) -> dict:
+        for p in _all_packages_cache:
+            if pkg_code(p) == code:
+                return p
+        return {}
+
+    def _entry(p: dict) -> dict:
+        return {
+            "code": pkg_code(p),
+            "name": pkg_name(p)[:100],
+            "rate": pkg_rate(p),
+            "specialty": pkg_specialty(p),
+            "package_category": pkg_category(p),
+            "pre_auth_document": p.get("PRE AUTH DOCUMENT", p.get("Mandatory Documents", "")),
+            "claim_document": p.get("CLAIM DOCUMENT", p.get("Mandatory Documents - Claim Processing", "")),
+        }
+
+    main_packages = []
+    implant_packages = []
+    addon_packages = []
+    custom_rates = req.custom_rates or {}
+
+    for code in req.package_codes:
+        p = get_full_package(code)
+        if not p:
+            continue
+        rate = custom_rates.get(code, pkg_rate(p))
+        entry = _entry(p)
+        entry["rate"] = rate
+        
+        c_up = pkg_category(p).upper()
+        s_up = pkg_specialty(p).upper()
+        n_up = pkg_name(p).upper()
+        
+        if "IMPLANT" in s_up or "IMPLANT" in c_up or "IMPLANT" in n_up:
+            implant_packages.append(entry)
+        elif "ADD-ON" in c_up or "ADDON" in c_up or "ADD-ON" in s_up or "ADDON" in s_up or "TRANSFUSION" in n_up:
+            entry["reason"] = "Manually selected addon package."
+            addon_packages.append(entry)
+        else:
+            main_packages.append(entry)
+
+    main_pkg_dict = main_packages[0] if main_packages else None
+    selected_packages = main_packages
+
+    subtotal = (main_pkg_dict["rate"] if main_pkg_dict else 0.0) + sum(imp["rate"] for imp in implant_packages)
+    
+    term_groups = [{
+        "term": flow.query or "Main Case",
+        "main_package": main_pkg_dict,
+        "implant_packages": implant_packages,
+        "stratification_packages": [],
+        "subtotal": subtotal
+    }]
+
+    from tools.smart_search_flow import validate_package_combination
+    blocked_rules = []
+    
+    if main_pkg_dict:
+        full_main = get_full_package(main_pkg_dict["code"])
+        if full_main:
+            full_imp = get_full_package(implant_packages[0]["code"]) if implant_packages else None
+            full_combo = []
+            for sp in selected_packages[1:]:
+                full_sp = get_full_package(sp["code"])
+                if full_sp:
+                    full_combo.append(full_sp)
+            for a in addon_packages:
+                full_a = get_full_package(a["code"])
+                if full_a:
+                    full_combo.append(full_a)
+            
+            valid, viols = validate_package_combination(full_main, full_imp, None, full_combo)
+            blocked_rules = viols
+
+    doctor_reasoning = "Calculated manually customized package bundle."
+    approval_likelihood = "MEDIUM"
+    if blocked_rules:
+        approval_likelihood = "LOW"
+    else:
+        approval_likelihood = "HIGH"
+
+    prompt = f"""You are a PMJAY/MAA Yojana package verification AI.
+The doctor has manually edited the selected package bundle.
+
+Case query/history: {flow.query}
+
+Selected Bundle:
+- Main package: {main_pkg_dict["name"] if main_pkg_dict else "None"} (Code: {main_pkg_dict["code"] if main_pkg_dict else "None"})
+- Implants: {', '.join([imp["name"] for imp in implant_packages]) or "None"}
+- Add-ons: {', '.join([add["name"] for add in addon_packages]) or "None"}
+
+Please provide:
+1. An AI clinical reason explaining why this combination of procedures/implants/addons is appropriate or if there are any PMJAY guidelines to note.
+2. The overall AI claim approval likelihood ("HIGH", "MEDIUM", or "LOW").
+
+Output ONLY raw valid JSON:
+{{
+  "doctor_reasoning": "A concise 2-3 sentence clinical reasoning explaining this specific package bundle combination.",
+  "approval_likelihood": "HIGH" | "MEDIUM" | "LOW"
+}}
+"""
+    try:
+        content = ""
+        if DEEPSEEK_API_KEY and _async_deepseek_client:
+            try:
+                resp = await _async_deepseek_client.chat.completions.create(
+                    model=DEEPSEEK_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    stream=False,
+                    reasoning_effort="high",
+                    temperature=0.0,
+                    response_format={"type": "json_object"},
+                    extra_body={"thinking": {"type": "enabled"}}
+                )
+                content = resp.choices[0].message.content
+            except Exception as d_err:
+                logger.warning(f"DeepSeek recalculate request error: {d_err}")
+                
+        if not content and _async_groq_client:
+            resp_groq = await _async_groq_client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                response_format={"type": "json_object"},
+            )
+            content = resp_groq.choices[0].message.content
+            
+        if content:
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0].strip()
+            ai_res = json.loads(content)
+            doctor_reasoning = ai_res.get("doctor_reasoning", doctor_reasoning)
+            approval_likelihood = ai_res.get("approval_likelihood", approval_likelihood)
+    except Exception as e:
+        logger.error(f"Error calling AI for recalculation: {e}")
+
+    if blocked_rules:
+        approval_likelihood = "LOW"
+
+    final_rec_dict = {
+        "main_package": main_pkg_dict,
+        "selected_packages": selected_packages,
+        "implant_package": implant_packages[0] if implant_packages else None,
+        "implant_packages": implant_packages,
+        "stratification_package": None,
+        "stratification_packages": [],
+        "addon_packages": addon_packages,
+        "term_groups": term_groups,
+        "blocked_rules": blocked_rules,
+        "approval_likelihood": approval_likelihood,
+        "doctor_reasoning": doctor_reasoning
+    }
+
+    flow.final_recommendation = final_rec_dict
+    _sync_session_db(req.session_id, flow, [], pt_type=getattr(flow, "patient_type", ""), scheme=getattr(flow, "scheme", ""))
+    
+    return final_rec_dict
+
+@app.post("/pro-interactive-search/{session_id}/select")
+async def submit_pro_step_selection(session_id: str, selection: SelectionRequest):
+    from tools.smart_search_flow import SearchStep
+    flow, all_pkgs, _, _ = await _get_or_reconstruct_flow(session_id)
+    step_num = flow.current_step
+    flow.set_selection(step_num, {"id": selection.option_id, "notes": selection.notes, "manual_package": selection.manual_package})
+    
+    sels = _interactive_flows[session_id].get("selections_list", [])
+    sels.append({"id": selection.option_id, "notes": selection.notes, "manual_package": selection.manual_package})
+    _interactive_flows[session_id]["selections_list"] = sels
+    
+    flow.current_step += 1
+    
+    # Intercept exact package selections to prevent AI looping
+    opt_val = str(selection.option_id).replace("ai_opt_", "").replace("package_", "")
+    selected_pkg = next((p for p in all_pkgs if pkg_code(p) == opt_val), None)
+    
+    if selected_pkg:
+        # The user clicked an exact package. Force SELECT_MAIN behavior.
+        p_label = pkg_name(selected_pkg)
+        p_rate = pkg_rate(selected_pkg)
+        p_desc = pkg_specialty(selected_pkg)
+        
+        step_idx = len(flow.steps)
+        step = SearchStep(step_idx, "Main Package Selected", "Exact package selected.", [
+            {"id": f"package_{opt_val}", "label": p_label, "description": p_desc, "rate": p_rate}
+        ])
+        flow.add_step(step)
+        flow.set_selection(step_idx, {"id": f"package_{opt_val}"})
+        flow.current_step += 1
+        
+    ok = await _advance_pro_dynamic_flow(session_id, depth=0)
+    if not ok:
+        flow.current_step -= 1
+        # Revert the selections_list to allow retry
+        if _interactive_flows[session_id].get("selections_list"):
+            _interactive_flows[session_id]["selections_list"].pop()
+        return SelectionResponse(success=False, message="AI Engine overloaded due to API rate limits. Please wait a few seconds and try again.")
+
+    
+    if flow.flow_complete:
+        final = await _build_final_recommendation(flow, all_pkgs)
+        flow.final_recommendation = final
+        return SelectionResponse(success=True, message="Search complete!", flow_complete=True, final_recommendation=final)
+
+    step = flow.steps[flow.current_step] if flow.current_step < len(flow.steps) else None
+    if not step:
+        return SelectionResponse(success=True, message="Flow completed.", flow_complete=True)
+    return SelectionResponse(success=True, message="Selection received.", next_step=_step_to_response(step))
+
+@app.get("/pro-interactive-search/{session_id}/step")
+async def get_pro_current_step(session_id: str):
+    return await get_current_step(session_id)
+
+@app.get("/pro-interactive-search/{session_id}/status")
+async def get_pro_flow_status(session_id: str):
+    return await get_flow_status(session_id)
+
+@app.post("/pro-interactive-search/{session_id}/undo")
+async def undo_pro_step_selection(session_id: str):
+    return await undo_step_selection(session_id)
+
+@app.post("/pro-interactive-search/{session_id}/feedback")
+async def submit_pro_feedback(session_id: str, request: Request):
+    try:
+        data = await request.json()
+        rating = data.get("rating")
+        logger.info(f"PRO SEARCH FEEDBACK: session={session_id} rating={rating}")
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 # ═══════════════════════════════════════════════════════════════════════

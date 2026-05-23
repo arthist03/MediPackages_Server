@@ -58,8 +58,11 @@ LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "4096"))
 
 # ── Groq API (Free fallback) ─────────────────────────────────────────
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL = os.getenv(
-    "GROQ_MODEL", "llama-3.1-8b-instant")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+
+# ── DeepSeek API (Pro Reasoning) ──────────────────────────────────────
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
 
 # ── Fallback: Local LLM (llama.cpp) ───────────────────────────────────
 USE_LOCAL_LLM = os.getenv("USE_LOCAL_LLM", "false").lower() == "true"
