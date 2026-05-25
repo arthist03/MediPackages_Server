@@ -245,7 +245,7 @@ def _get_groq_client():
     if not GROQ_API_KEY:
         return None
     from groq import Groq
-    return Groq(api_key=GROQ_API_KEY)
+    return Groq(api_key=GROQ_API_KEY, max_retries=0)
 
 
 def _is_surgical_case(extracted_data: dict) -> bool:

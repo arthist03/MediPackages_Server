@@ -678,9 +678,9 @@ def generate_stratification_options(main_package: Dict[str, Any], packages: List
 
 def _is_addon_package(pkg: Dict) -> bool:
     """Return True if package appears to be an add-on package."""
-    name_clean = _get_pkg_name(pkg).upper().replace(" ", "").replace("-", "")
-    cat_clean = _get_pkg_cat(pkg).upper().replace(" ", "").replace("-", "")
-    return bool('[ADDON' in name_clean or 'ADDON' in cat_clean)
+    name_clean = _get_pkg_name(pkg).upper()
+    cat_clean = _get_pkg_cat(pkg).upper()
+    return any(s in name_clean or s in cat_clean for s in ("[ADD-ON", "[ADD ON", "ADDON", "ADD-ON", "ADD ON"))
 
 
 def _is_standalone_pkg(pkg: Dict) -> bool:
@@ -695,13 +695,26 @@ def _is_surgical_pkg(pkg: Dict) -> bool:
     rate = _get_pkg_rate(pkg)
     name = _get_pkg_name(pkg).upper()
     cat = _get_pkg_cat(pkg).upper()
-    return rate > 0 and ('[REGULAR PROCEDURE]' in name or 'REGULAR PKG' in cat)
+    
+    # Exclude implants, add-ons, and extended stay from being treated as primary surgical
+    implant_field = str(_get_pkg_field(pkg, ["IMPLANT PACKAGE", "IMPLANT"], "NO IMPLANT") or "NO IMPLANT").upper()
+    is_implant = ("IMPLANT" in implant_field and "NO IMPLANT" not in implant_field) or cat == "IMP" or "IMPLANT" in name
+    is_addon = _is_addon_package(pkg)
+    is_extended = 'EXTENDED LOS' in name
+    
+    return rate > 0 and not is_addon and not is_implant and not is_extended
 
 
 def _is_medical_mgmt_pkg(pkg: Dict) -> bool:
     """Identify medical management (₹0) packages."""
     rate = _get_pkg_rate(pkg)
-    return rate == 0 and not _is_addon_package(pkg)
+    is_addon = _is_addon_package(pkg)
+    # Exclude implants from medical management
+    name = _get_pkg_name(pkg).upper()
+    cat = _get_pkg_cat(pkg).upper()
+    implant_field = str(_get_pkg_field(pkg, ["IMPLANT PACKAGE", "IMPLANT"], "NO IMPLANT") or "NO IMPLANT").upper()
+    is_implant = ("IMPLANT" in implant_field and "NO IMPLANT" not in implant_field) or cat == "IMP" or "IMPLANT" in name
+    return rate == 0 and not is_addon and not is_implant
 
 
 def _is_extended_los_pkg(pkg: Dict) -> bool:

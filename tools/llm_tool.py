@@ -36,8 +36,8 @@ def _get_groq_client():
             "GROQ_API_KEY not set in environment. Get one at https://console.groq.com/keys")
 
     from groq import Groq
-    _groq_client = Groq(api_key=GROQ_API_KEY)
-    logger.info(f"Groq client initialized: {GROQ_MODEL}")
+    _groq_client = Groq(api_key=GROQ_API_KEY, max_retries=0)
+    logger.info(f"Groq client initialized: {GROQ_MODEL} (max_retries=0)")
     return _groq_client
 
 

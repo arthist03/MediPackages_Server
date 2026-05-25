@@ -282,9 +282,48 @@ def _normalize_padded(value: str) -> str:
     return f" {' '.join((value or '').lower().replace('/', ' ').replace('-', ' ').split())} "
 
 
+CLINICAL_ABBREVIATIONS = {
+    "tkr": "Total Knee Replacement",
+    "thr": "Total Hip Replacement",
+    "ptca": "Percutaneous Transluminal Coronary Angioplasty",
+    "pci": "Percutaneous Coronary Intervention",
+    "cabg": "Coronary Artery Bypass Grafting",
+    "lap chole": "Laparoscopic Cholecystectomy",
+    "lap": "Laparoscopic",
+    "icu": "Intensive Care Unit",
+    "los": "Length of Stay",
+    "dvt": "Deep Vein Thrombosis",
+    "lmwh": "Low Molecular Weight Heparin",
+    "mi": "Myocardial Infarction",
+    "stemi": "ST-Elevation Myocardial Infarction",
+    "nstemi": "Non-ST-Elevation Myocardial Infarction",
+    "pcnl": "Percutaneous Nephrolithotomy",
+    "sdp": "Single Donor Platelet",
+    "ffp": "Fresh Frozen Plasma",
+    "turp": "Transurethral Resection of the Prostate",
+    "vvf": "Vesicovaginal Fistula",
+    "avd": "Atrioventricular Block",
+}
+
+
 async def _expand_abbreviations_llm(text: str) -> str:
-    """Uses LLM to dynamically expand medical abbreviations in Indian clinical context."""
-    if not text or len(text.strip()) > 100 or not _async_groq_client:
+    """Uses local clinical maps or LLM to expand medical abbreviations in Indian clinical context."""
+    if not text:
+        return text
+
+    # Try local abbreviation expansions first (instant, saves tokens, avoids rate limits)
+    t = text.lower()
+    has_local_match = False
+    for ab, full in CLINICAL_ABBREVIATIONS.items():
+        pattern = r'\b' + re.escape(ab) + r'\b'
+        if re.search(pattern, t, flags=re.IGNORECASE):
+            text = re.sub(pattern, full, text, flags=re.IGNORECASE)
+            has_local_match = True
+
+    if has_local_match:
+        return text
+
+    if len(text.strip()) > 100 or not _async_groq_client:
         return text
 
     # Check cache first
@@ -326,6 +365,7 @@ Output:"""
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
             max_tokens=60,
+            timeout=2.0,
         )
         # Parse only the first line to strip trailing explanations if the LLM ignores instructions
         expanded = resp.choices[0].message.content.strip().split('\n')[0].strip('"').strip("'")
@@ -498,13 +538,21 @@ def _identify_package_type(pkg: dict) -> dict[str, bool]:
     implant_upper = pkg_implant_field(pkg).upper()
     cat_upper = pkg_category(pkg).upper()
 
+    is_implant = ("IMPLANT" in implant_upper and "NO IMPLANT" not in implant_upper) or cat_upper == "IMP" or "IMPLANT" in name_upper
+    is_addon = any(s in name_upper or s in cat_upper for s in ("[ADD-ON", "[ADD ON", "ADDON", "ADD-ON", "ADD ON"))
+    is_extended_los = "EXTENDED LOS" in name_upper
+    is_standalone = any(s in name_upper or s in cat_upper for s in ("STAND-ALONE", "STAND ALONE"))
+    
+    is_surgical = rate > 0 and not is_addon and not is_implant and not is_extended_los
+    is_medical_management = rate == 0 and not is_addon and not is_implant
+
     return {
-        "is_surgical":           rate > 0 and ("[REGULAR PROCEDURE]" in name_upper or "REGULAR PKG" in cat_upper),
-        "is_medical_management": rate == 0 and "[ADD-ON" not in name_upper and "[ADD ON" not in name_upper,
-        "is_standalone":         any(s in name_upper or s in cat_upper for s in ("STAND-ALONE", "STAND ALONE")),
-        "is_addon":              any(s in name_upper or s in cat_upper for s in ("[ADD-ON", "[ADD ON", "ADDON", "ADD-ON", "ADD ON")),
-        "is_implant":            ("IMPLANT" in implant_upper and "NO IMPLANT" not in implant_upper) or cat_upper == "IMP",
-        "is_extended_los":       "EXTENDED LOS" in name_upper,
+        "is_surgical":           is_surgical,
+        "is_medical_management": is_medical_management,
+        "is_standalone":         is_standalone,
+        "is_addon":              is_addon,
+        "is_implant":            is_implant,
+        "is_extended_los":       is_extended_los,
         "source":                pkg.get("_source", "maa"),
     }
 
@@ -726,8 +774,29 @@ def _cached_search_packages_basic(query: str, limit: int = 50, patient_type: str
         if has_cabg_in_query:
             if is_cabg_package:
                 score += 40
-            if is_ptca_package:
-                score -= 60
+        # Surgical vs Medical logic based on query indicators
+        has_surgical_in_query = any(tok in query_lower for tok in {
+            "replacement", "surgery", "surgical", "operative", "repair", "ectomy", "plasty", "otomy", 
+            "resection", "ptca", "cabg", "fixation", "orif", "cholecystectomy", "appendicectomy", "hysterectomy"
+        })
+        has_medical_in_query = any(tok in query_lower for tok in {
+            "anemia", "anaemia", "thalassemia", "sepsis", "septicemia", "fever", "diarrhoea", "diarrhea", "medical"
+        })
+        
+        pkg_types = _identify_package_type(pkg)
+        is_surgical_package = pkg_types["is_surgical"]
+        is_medical_package = pkg_types["is_medical_management"]
+        
+        if has_surgical_in_query and not has_medical_in_query:
+            if is_surgical_package:
+                score += 150
+            if is_medical_package:
+                score -= 150
+        elif has_medical_in_query and not has_surgical_in_query:
+            if is_medical_package:
+                score += 150
+            if is_surgical_package:
+                score -= 150
 
         if score > 0:
             scored.append((exact_p, score, pkg))
@@ -1044,9 +1113,9 @@ async def lifespan(app: FastAPI):
     if not GROQ_API_KEY:
         logger.error("⚠️ GROQ_API_KEY not set! https://console.groq.com/keys")
     else:
-        _groq_client = Groq(api_key=GROQ_API_KEY)
-        _async_groq_client = AsyncGroq(api_key=GROQ_API_KEY, max_retries=1)
-        logger.info("✅ Groq API keys configured — clients initialised")
+        _groq_client = Groq(api_key=GROQ_API_KEY, max_retries=0)
+        _async_groq_client = AsyncGroq(api_key=GROQ_API_KEY, max_retries=0)
+        logger.info("✅ Groq API keys configured — clients initialised (max_retries=0)")
 
     if not FIREBASE_SERVICE_ACCOUNT:
         logger.warning("⚠️ FIREBASE_SERVICE_ACCOUNT not set – push notifications disabled")
@@ -1060,7 +1129,8 @@ async def lifespan(app: FastAPI):
             global _async_deepseek_client
             _async_deepseek_client = AsyncOpenAI(
                 api_key=DEEPSEEK_API_KEY,
-                base_url="https://api.deepseek.com"
+                base_url="https://api.deepseek.com",
+                max_retries=0
             )
             logger.info("✅ DeepSeek API configured")
         except ImportError:
@@ -2013,13 +2083,97 @@ def _sync_session_db(session_id: str, flow: Any, sels: list[dict], pt_type: str 
         logger.error("Failed to sync session: %s", e)
 
 
+def _deterministic_keyword_extractor(query: str) -> dict:
+    t = (query or "").lower()
+    keywords = []
+    
+    # Mapping of common abbreviations and terms to standard package names
+    clinical_keywords_map = {
+        # Orthopedics
+        "tkr": "Total Knee Replacement",
+        "total knee replacement": "Total Knee Replacement",
+        "thr": "Total Hip Replacement",
+        "total hip replacement": "Total Hip Replacement",
+        "fracture": "Fracture",
+        "arthroplasty": "Arthroplasty",
+        
+        # Cardiology / Cardiothoracic
+        "ptca": "PTCA",
+        "angioplasty": "PTCA",
+        "cabg": "CABG",
+        "coronary artery bypass": "CABG",
+        "angiography": "Coronary Angiography",
+        "myocardial infarction": "Myocardial Infarction",
+        "heart attack": "Myocardial Infarction",
+        "chest pain": "Myocardial Infarction",
+        
+        # Gastrointestinal / General Surgery
+        "appendicectomy": "Appendicectomy",
+        "appendectomy": "Appendicectomy",
+        "appendicitis": "Appendicectomy",
+        "cholecystectomy": "Cholecystectomy",
+        "cholecystitis": "Cholecystectomy",
+        "lap chole": "Cholecystectomy",
+        "hernia": "Hernia",
+        "inguinal hernia": "Hernia",
+        
+        # Urology / Nephrology
+        "pcnl": "PCNL",
+        "renal transplant": "Renal Transplant",
+        "kidney transplant": "Renal Transplant",
+        "kidney stone": "Renal Calculi",
+        
+        # Burns
+        "burns": "Burns",
+        "thermal burns": "Burns",
+        
+        # Gynecology
+        "hysterectomy": "Hysterectomy",
+        
+        # Medical / Supportive
+        "blood transfusion": "Blood Transfusion",
+        "transfusion": "Blood Transfusion",
+        "anemia": "Anemia",
+        "anaemia": "Anemia",
+        "thalassemia": "Thalassemia",
+        "sepsis": "Sepsis",
+        "septicemia": "Sepsis",
+        "icu": "ICU Stay",
+        "ventilator": "Ventilator Support",
+        "extended los": "Extended LOS",
+    }
+    
+    for term, standard in clinical_keywords_map.items():
+        pattern = r'\b' + re.escape(term) + r'\b'
+        if re.search(pattern, t, flags=re.IGNORECASE):
+            keywords.append(standard)
+            
+    # Deduplicate
+    seen = set()
+    deduped = []
+    for k in keywords:
+        if k.lower() not in seen:
+            seen.add(k.lower())
+            deduped.append(k)
+            
+    # Fallback to query if empty
+    if not deduped:
+        deduped = [query]
+        
+    detected_pt = _detect_patient_type_from_text(query)
+    
+    return {
+        "summary": "Clinical Case Summary (Deterministic Fallback)",
+        "msso_instructions": "Verify matched packages.",
+        "keywords": deduped,
+        "patient_type": detected_pt,
+    }
+
+
 async def _extract_keywords_from_history(query: str) -> dict:
     if not _async_groq_client:
-        return {
-            "summary": query,
-            "keywords": [query],
-            "patient_type": _detect_patient_type_from_text(query),
-        }
+        return _deterministic_keyword_extractor(query)
+        
     # Build a dynamic list of valid specialties + procedure keywords from loaded packages
     _load_packages_cache()
     specialty_names = sorted({pkg_specialty(p).strip() for p in _all_packages_cache if pkg_specialty(p).strip()})
@@ -2071,7 +2225,9 @@ Return ONLY valid JSON in this format: {{"summary": "...", "msso_instructions": 
         resp = await _async_groq_client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.0, response_format={"type": "json_object"},
+            temperature=0.0,
+            response_format={"type": "json_object"},
+            timeout=3.0,
         )
         parsed = json.loads(resp.choices[0].message.content)
 
@@ -2099,14 +2255,8 @@ Return ONLY valid JSON in this format: {{"summary": "...", "msso_instructions": 
             "patient_type": ai_patient_type,
         }
     except Exception as e:
-        logger.error("Query analysis failed: %s", e)
-        detected_pt = _detect_patient_type_from_text(query)
-        return {
-            "summary": query,
-            "msso_instructions": "",
-            "keywords": [query],
-            "patient_type": detected_pt,
-        }
+        logger.error("Query analysis failed: %s. Using deterministic fallback.", e)
+        return _deterministic_keyword_extractor(query)
 
 @app.post("/interactive-search/analyze-query")
 async def analyze_interactive_query(request: AnalyzeQueryRequest):
@@ -2146,25 +2296,36 @@ async def start_interactive_search(request: InteractiveSearchStartRequest):
         from tools.smart_search_flow import build_search_flow, _split_query_terms as flow_split, advance_past_empty_optional_steps
         import asyncio
 
-        expanded_query, expanded_proc, expanded_dis = await asyncio.gather(
-            _expand_abbreviations_llm(request.query),
+        expanded_proc, expanded_dis = await asyncio.gather(
             _expand_abbreviations_llm(request.procedure),
             _expand_abbreviations_llm(request.disease)
         )
 
-        terms = flow_split(expanded_query)
-        if expanded_proc:
+        corrections = {}
+        pt_type = request.patient_type
+
+        # Extract keywords if it's a long clinical history sentence/paragraph
+        if len((request.query or "").split()) > 3:
+            hist_res = await _extract_keywords_from_history(request.query)
+            terms = hist_res.get("keywords", [])
+            if not pt_type:
+                pt_type = hist_res.get("patient_type", "")
+        else:
+            expanded_query = await _expand_abbreviations_llm(request.query)
+            terms = flow_split(expanded_query)
+            terms, corrections = _correct_query_terms_spelling(terms)
+
+        if expanded_proc and expanded_proc not in terms:
             terms.insert(0, expanded_proc)
         if expanded_dis and expanded_dis not in terms:
             terms.append(expanded_dis)
-        terms, corrections = _correct_query_terms_spelling(terms)
+            
         terms = _clean_query_terms(terms)
         if not terms:
             raise HTTPException(400, "Please provide a query, procedure, or disease")
 
         main_term = terms[0]
         addon_terms = terms[1:]
-        pt_type = request.patient_type
         if not pt_type:
             pt_type = _detect_patient_type_from_text(request.query)
         scheme = request.scheme  # 'maa', 'pmjay', or ''
@@ -2527,7 +2688,8 @@ CRITICAL:
                     reasoning_effort="high",
                     temperature=0.0,
                     response_format={"type": "json_object"},
-                    extra_body={"thinking": {"type": "enabled"}}
+                    extra_body={"thinking": {"type": "enabled"}},
+                    timeout=3.0
                 )
                 content = resp.choices[0].message.content
             except Exception as d_err:
@@ -2541,6 +2703,7 @@ CRITICAL:
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
                 response_format={"type": "json_object"},
+                timeout=3.0
             )
             content = resp_groq.choices[0].message.content
             
@@ -2614,7 +2777,123 @@ CRITICAL:
         logger.error("Pro AI flow error: %s", e)
         return False
 
+def _deterministic_choice_matcher(query: str, options: list[dict], step_type: str) -> Optional[dict]:
+    q = (query or "").lower()
+    
+    # 1. Skip / No Implant detection
+    if "without implant" in q or "no implant" in q:
+        for opt in options:
+            opt_id = str(opt.get("id", "")).lower()
+            opt_code = str(opt.get("code", "")).lower()
+            if "skip" in opt_id or "no_implant" in opt_code:
+                return opt
+
+    # 2. Bilateral vs Unilateral
+    if "bilateral" in q:
+        for opt in options:
+            label = str(opt.get("label", "")).lower()
+            desc = str(opt.get("description", "")).lower()
+            if "bilateral" in label or "bilateral" in desc:
+                return opt
+    else:
+        # Check if unilateral / primary / single is specified
+        has_bilateral_opt = any("bilateral" in str(opt.get("label", "")).lower() for opt in options)
+        if has_bilateral_opt:
+            for opt in options:
+                label = str(opt.get("label", "")).lower()
+                desc = str(opt.get("description", "")).lower()
+                if "unilateral" in label or "unilateral" in desc or "single" in label or "primary knee replacement" in label:
+                    return opt
+
+    # 3. Laparoscopic vs Open
+    if "laparoscopic" in q or "lap " in q or "laparoscop" in q:
+        for opt in options:
+            label = str(opt.get("label", "")).lower()
+            if "laparoscopic" in label or "lap." in label or "lap " in label or "laparoscop" in label:
+                return opt
+    elif "open" in q:
+        for opt in options:
+            label = str(opt.get("label", "")).lower()
+            if "open" in label:
+                return opt
+
+    # 4. NABH vs Non-NABH / Public vs Private
+    if "non-nabh" in q or "non nabh" in q:
+        for opt in options:
+            label = str(opt.get("label", "")).lower()
+            if "non-nabh" in label or "non nabh" in label:
+                return opt
+    elif "nabh" in q:
+        for opt in options:
+            label = str(opt.get("label", "")).lower()
+            if "nabh" in label and "non-nabh" not in label:
+                return opt
+
+    if "public" in q:
+        for opt in options:
+            label = str(opt.get("label", "")).lower()
+            if "public" in label:
+                return opt
+    elif "private" in q:
+        for opt in options:
+            label = str(opt.get("label", "")).lower()
+            if "private" in label:
+                return opt
+
+    # 5. General keyword matching
+    # Check if any option code is in the query
+    for opt in options:
+        code = str(opt.get("code", "")).strip().lower()
+        if code and len(code) > 4 and code in q:
+            return opt
+
+    return None
+
+def _deterministic_multiple_choices_matcher(query: str, options: list[dict], step_type: str) -> list[dict]:
+    q = (query or "").lower()
+    matched = []
+    
+    for opt in options:
+        opt_id = str(opt.get("id", "")).lower()
+        if "skip" in opt_id or "manual_add" in opt_id:
+            continue
+        label = str(opt.get("label", "")).lower()
+        desc = str(opt.get("description", "")).lower()
+        combined = label + " " + desc
+        
+        # Blood transfusion
+        if "transfusion" in combined or "blood" in combined or "packed cell" in combined or "platelet" in combined:
+            if "transfusion" in q or "blood" in q or "packed cell" in q or "platelet" in q or "sdp" in q:
+                matched.append(opt)
+                continue
+                
+        # ICU
+        if "icu" in combined or "intensive care" in combined:
+            if "icu" in q or "intensive care" in q:
+                matched.append(opt)
+                continue
+                
+        # Ventilator
+        if "ventilator" in combined or "ventilation" in combined or "respiratory support" in combined:
+            if "ventilator" in q or "ventilation" in q or "intubated" in q or "intubation" in q:
+                matched.append(opt)
+                continue
+                
+        # Extended LOS
+        if "extended los" in combined or "extended length of stay" in combined or "extended stay" in combined:
+            if "extended los" in q or "extended length" in q or "extended stay" in q or " anticoagulation " in q or "dvt" in q:
+                matched.append(opt)
+                continue
+                
+    return matched
+
 async def _check_query_for_choice(query: str, options: list[dict], step_type: str, client: Any) -> Optional[dict]:
+    # Call deterministic matcher first
+    det_match = _deterministic_choice_matcher(query, options, step_type)
+    if det_match:
+        logger.info(f"Deterministic choice match for {step_type}: {det_match.get('id')}")
+        return det_match
+        
     if not client:
         return None
     
@@ -2661,6 +2940,7 @@ Return a JSON object:
             temperature=0.0,
             max_tokens=300,
             response_format={"type": "json_object"},
+            timeout=2.0,
         )
         data = json.loads(resp.choices[0].message.content)
         matched_id = data.get("matched_id")
@@ -2675,6 +2955,12 @@ Return a JSON object:
     return None
 
 async def _check_query_for_multiple_choices(query: str, options: list[dict], step_type: str, client: Any) -> list[dict]:
+    # Call deterministic matcher first
+    det_matches = _deterministic_multiple_choices_matcher(query, options, step_type)
+    if det_matches:
+        logger.info(f"Deterministic multiple choice matches for {step_type}: {[m.get('id') for m in det_matches]}")
+        return det_matches
+        
     if not client:
         return []
     
@@ -2712,6 +2998,7 @@ Return a JSON object:
             temperature=0.0,
             max_tokens=300,
             response_format={"type": "json_object"},
+            timeout=2.0,
         )
         data = json.loads(resp.choices[0].message.content)
         matched_ids = data.get("matched_ids", [])
@@ -2908,6 +3195,7 @@ class RecalculateRequest(BaseModel):
     session_id: str
     package_codes: list[str]
     custom_rates: Optional[dict[str, float]] = None
+    package_types: Optional[dict[str, str]] = None
 
 @app.post("/pro-interactive-search/recalculate")
 async def recalculate_pro_recommendation(req: RecalculateRequest):
@@ -2936,7 +3224,9 @@ async def recalculate_pro_recommendation(req: RecalculateRequest):
     main_packages = []
     implant_packages = []
     addon_packages = []
+    stratification_packages = []
     custom_rates = req.custom_rates or {}
+    package_types = req.package_types or {}
 
     for code in req.package_codes:
         p = get_full_package(code)
@@ -2950,24 +3240,42 @@ async def recalculate_pro_recommendation(req: RecalculateRequest):
         s_up = pkg_specialty(p).upper()
         n_up = pkg_name(p).upper()
         
-        if "IMPLANT" in s_up or "IMPLANT" in c_up or "IMPLANT" in n_up:
+        forced_type = package_types.get(code, "AUTO")
+        
+        if forced_type == "IMPLANT":
+            entry["reason"] = "Manually selected implant package."
             implant_packages.append(entry)
-        elif "ADD-ON" in c_up or "ADDON" in c_up or "ADD-ON" in s_up or "ADDON" in s_up or "TRANSFUSION" in n_up:
+        elif forced_type == "STRATIFICATION":
+            entry["reason"] = "Manually selected stratification package."
+            stratification_packages.append(entry)
+        elif forced_type == "ADDON":
             entry["reason"] = "Manually selected addon package."
             addon_packages.append(entry)
-        else:
+        elif forced_type == "MAIN":
+            entry["reason"] = "Manually selected main package."
             main_packages.append(entry)
+        else:
+            if "IMPLANT" in s_up or "IMPLANT" in c_up or "IMPLANT" in n_up:
+                implant_packages.append(entry)
+            elif "ADD-ON" in c_up or "ADDON" in c_up or "ADD-ON" in s_up or "ADDON" in s_up or "TRANSFUSION" in n_up:
+                entry["reason"] = "Manually selected addon package."
+                addon_packages.append(entry)
+            elif "-STR" in code.upper() or "STRATIFICATION" in c_up or "STRATIFICATION" in n_up or "EXTENDED" in n_up:
+                entry["reason"] = "Manually selected stratification package."
+                stratification_packages.append(entry)
+            else:
+                main_packages.append(entry)
 
     main_pkg_dict = main_packages[0] if main_packages else None
     selected_packages = main_packages
 
-    subtotal = (main_pkg_dict["rate"] if main_pkg_dict else 0.0) + sum(imp["rate"] for imp in implant_packages)
+    subtotal = (main_pkg_dict["rate"] if main_pkg_dict else 0.0) + sum(imp["rate"] for imp in implant_packages) + sum(strat["rate"] for strat in stratification_packages)
     
     term_groups = [{
         "term": flow.query or "Main Case",
         "main_package": main_pkg_dict,
         "implant_packages": implant_packages,
-        "stratification_packages": [],
+        "stratification_packages": stratification_packages,
         "subtotal": subtotal
     }]
 
@@ -3041,6 +3349,7 @@ Output ONLY raw valid JSON:
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
                 response_format={"type": "json_object"},
+                timeout=3.0,
             )
             content = resp_groq.choices[0].message.content
             
@@ -3061,8 +3370,8 @@ Output ONLY raw valid JSON:
         "selected_packages": selected_packages,
         "implant_package": implant_packages[0] if implant_packages else None,
         "implant_packages": implant_packages,
-        "stratification_package": None,
-        "stratification_packages": [],
+        "stratification_package": stratification_packages[0] if stratification_packages else None,
+        "stratification_packages": stratification_packages,
         "addon_packages": addon_packages,
         "term_groups": term_groups,
         "blocked_rules": blocked_rules,
