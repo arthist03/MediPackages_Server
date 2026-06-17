@@ -320,7 +320,12 @@ def generate_package_options(
     options = []
     seen_codes = set()
     selected_lower = _normalize(selected_procedure)
-    selected_tokens = _get_token_set(selected_procedure)
+    
+    # ── Spelling normalization for common variants ──
+    if "c-section" in selected_lower or "c section" in selected_lower or "cesarean" in selected_lower:
+        selected_lower = selected_lower.replace("c-section", "caesarean").replace("c section", "caesarean").replace("cesarean", "caesarean")
+        
+    selected_tokens = _get_token_set(selected_lower)
 
     ranking_tokens = list(selected_tokens)
     if "angioplasty" in selected_lower or "ptca" in selected_lower or "pci" in selected_lower:
@@ -361,6 +366,7 @@ def generate_package_options(
 
         # Exact / word-set matching (fastest possible)
         norm_selected = " ".join(ranking_tokens)
+        
         if norm_selected in code.lower():
             score += 70
         if norm_selected in name_n:
@@ -381,14 +387,32 @@ def generate_package_options(
             exact_priority = 3
             score += 500
 
+        # ── Multi-word phrase boosting (prevents Arthrodesis outranking TKR) ──
+        # Extract multi-word phrases (3+ words) from the query and boost exact matches
+        selected_words = selected_lower.split()
+        if len(selected_words) >= 3:
+            # Check all contiguous 3+ word subsequences against the package name
+            for phrase_len in range(len(selected_words), 2, -1):
+                for start_idx in range(len(selected_words) - phrase_len + 1):
+                    phrase = " ".join(selected_words[start_idx:start_idx + phrase_len])
+                    if len(phrase) > 8 and phrase in name_n:  # Only meaningful phrases
+                        bonus = 200 * phrase_len  # Longer phrases = bigger bonus
+                        score += bonus
+                        exact_priority = max(exact_priority, 3)
+                        break  # Found best match for this phrase length
+                else:
+                    continue
+                break  # Stop at longest matching phrase
+
         if "regular" in name_n:
             score += 2
         if "day care" in name_n or "daycare" in category.lower():
             score += 1
 
         is_blood_query = "blood" in selected_lower or "transfusion" in selected_lower
+        # ── Stronger add-on demotion — add-ons should rarely be primary picks ──
         if _ADDON_RE.search(name_n) and not is_blood_query:
-            score -= 1
+            score -= 100  # Strong penalty for add-on packages in primary context
 
         # Specific boost for blood standalone packages if requested explicitly
         if is_blood_query:
@@ -413,12 +437,41 @@ def generate_package_options(
             if "peripheral" in name_n or "vascular" in spec_n:
                 score -= 6
 
-        # ── TBSA % range smart boost (fixes Test 1 ambiguity) ──────────────
-        if _tbsa_pct is not None and ("tbsa" in name_n or "body surface" in name_n):
+        # ── Cholecystectomy CBD Exploration & Lap/Open smart boost ─────────
+        if "cholecystectomy" in selected_lower or "gallbladder" in selected_lower:
+            # Check for CBD terms in user query
+            has_cbd = any(term in selected_lower for term in ["cbd", "common bile duct", "exploration"])
+            has_lap = any(term in selected_lower for term in ["lap", "laparoscopic"])
+            has_open = "open" in selected_lower
+            
+            if "with exploration" in name_n or "with cbd" in name_n:
+                if has_cbd:
+                    score += 300  # Query asked for CBD, package has CBD -> Big boost
+                else:
+                    score -= 300  # Query didn't ask for CBD, package has CBD -> Heavy penalty
+            elif "without exploration" in name_n or "without cbd" in name_n:
+                if not has_cbd:
+                    score += 200  # Query didn't ask for CBD, package is Without CBD -> Boost
+                else:
+                    score -= 300  # Query asked for CBD, package is Without -> Penalty
+                    
+            if has_lap and "lap" in name_n:
+                score += 150
+            elif has_open and "open" in name_n:
+                score += 150
+            elif has_lap and "open" in name_n:
+                score -= 200
+            elif has_open and "lap" in name_n:
+                score -= 200
+            if "peripheral" in name_n or "vascular" in spec_n:
+                score -= 6
+
+        # ── TBSA % range smart boost (improved range parsing) ──────────────
+        if _tbsa_pct is not None and ("tbsa" in name_n or "body surface" in name_n or "%" in name_n):
             import re as _re2
             # Extract range from package name e.g. "40 % - 60 %", "25-40", "upto 25"
-            _pkg_ranges = _re2.findall(r'(\d+)\s*[-to]+\s*(\d+)', name_n)
-            _pkg_upper = _re2.findall(r'up\s*to\s*(\d+)', name_n)
+            _pkg_ranges = _re2.findall(r'(\d+)\s*(?:%?\s*[-–]|to)\s*(\d+)', name_n)
+            _pkg_upper = _re2.findall(r'(?:up\s*to|upto)\s*(\d+)', name_n)
             _pkg_above = _re2.findall(r'>\s*(\d+)', name_n)
             matched_range = False
             for lo, hi in _pkg_ranges:
@@ -435,24 +488,56 @@ def generate_package_options(
                     score += 300
                     matched_range = True
             if not matched_range:
-                score -= 50  # different band — penalise
+                score -= 150  # different band — strong penalty to prevent wrong range
 
-        # ── Amputation / electrical burns smart scoring (fixes Test 3) ─────
-        if _has_amputation:
+        # ── Amputation / electrical burns compound scoring ──────────────────
+        # When BOTH voltage AND limb-loss are in query, the combined package gets super-boost
+        if _has_amputation and _has_high_voltage:
+            # Must match BOTH: "high voltage" AND "with ... limb"
+            if "high voltage" in name_n and ("with part of limb" in name_n or "limb loss" in name_n or "with amputation" in name_n):
+                score += 500   # exact compound match
+            elif "high voltage" in name_n and ("without part of limb" in name_n or "without limb" in name_n):
+                score -= 300   # correct voltage but wrong limb status
+            elif "low voltage" in name_n:
+                score -= 300   # wrong voltage entirely
+            elif "with part of limb" in name_n or "limb loss" in name_n:
+                # Right limb status but wrong/no voltage
+                if "low voltage" in name_n:
+                    score -= 200
+        elif _has_amputation and _has_low_voltage:
+            if "low voltage" in name_n and ("with part of limb" in name_n or "limb loss" in name_n):
+                score += 500
+            elif "low voltage" in name_n and ("without part of limb" in name_n or "without limb" in name_n):
+                score -= 300
+            elif "high voltage" in name_n:
+                score -= 300
+        elif _has_amputation:
             if "with part of limb" in name_n or "limb loss" in name_n or "with amputation" in name_n:
                 score += 300   # correct "WITH limb loss" package
             if "without part of limb" in name_n or "without limb" in name_n:
                 score -= 200   # strongly penalise "WITHOUT" package
-        if _has_high_voltage:
+        if _has_high_voltage and not _has_amputation:
             if "high voltage" in name_n:
                 score += 100
             if "low voltage" in name_n:
                 score -= 80
-        if _has_low_voltage:
+        if _has_low_voltage and not _has_amputation:
             if "low voltage" in name_n:
                 score += 100
             if "high voltage" in name_n:
                 score -= 80
+
+        # ── Sepsis severity matching ───────────────────────────────────────
+        if "severe sepsis" in selected_lower:
+            if "severe sepsis" in name_n:
+                score += 300
+            elif "septic shock" in name_n:
+                score -= 50   # different severity level
+        elif "septic shock" in selected_lower:
+            if "septic shock" in name_n:
+                score += 300
+            elif "severe sepsis" in name_n:
+                score -= 50
 
         return exact_priority, score
 

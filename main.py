@@ -1044,12 +1044,18 @@ def _build_raw_package_row(pkg: dict, ai_selected: bool = False) -> dict:
 
 def _prune_stale_sessions() -> None:
     now = time.time()
-    stale = [sid for sid, d in _pending_sessions.items()
+    stale_pending = [sid for sid, d in _pending_sessions.items()
              if now - d.get("created_at", now) > SESSION_TTL_SECONDS]
-    for sid in stale:
+    for sid in stale_pending:
         _pending_sessions.pop(sid, None)
-    if stale:
-        logger.info("Pruned %d stale session(s)", len(stale))
+        
+    stale_flows = [sid for sid, d in _interactive_flows.items()
+             if now - d.get("created_at", now) > SESSION_TTL_SECONDS]
+    for sid in stale_flows:
+        _interactive_flows.pop(sid, None)
+
+    if stale_pending or stale_flows:
+        logger.info("Pruned %d stale pending session(s), %d stale interactive flow(s)", len(stale_pending), len(stale_flows))
 
 
 def _normalize_interactive_step_title(step_name: str) -> str:
@@ -1339,6 +1345,12 @@ class SelectionRequest(BaseModel):
     option_id: str
     notes: Optional[str] = None
     manual_package: Optional[dict] = None
+
+class RecalculateRequest(BaseModel):
+    session_id: str
+    package_codes: list[str]
+    custom_rates: Optional[dict[str, float]] = None
+    package_types: Optional[dict[str, str]] = None
 
 
 class SelectionResponse(BaseModel):
@@ -2087,13 +2099,45 @@ def _deterministic_keyword_extractor(query: str) -> dict:
     t = (query or "").lower()
     keywords = []
     
-    # Mapping of common abbreviations and terms to standard package names
+    # ── Phase 1: Compound clinical term detection (MUST run first) ──────────
+    # These are multi-word patterns that map to a SINGLE package keyword.
+    # Order matters: check longer/more-specific patterns first.
+    compound_clinical_map = [
+        # Electrical burns — compound conditions (voltage + limb status)
+        (r'high\s+voltage.*(?:limb\s*loss|amputat)', "Electrical contact burns High voltage with limb loss"),
+        (r'(?:limb\s*loss|amputat).*high\s+voltage', "Electrical contact burns High voltage with limb loss"),
+        (r'high\s+voltage.*(?:electr|burn|contact)', "Electrical contact burns High voltage"),
+        (r'(?:electr|contact).*burn.*high\s+voltage', "Electrical contact burns High voltage"),
+        (r'low\s+voltage.*(?:limb\s*loss|amputat)', "Electrical contact burns Low voltage with limb loss"),
+        (r'(?:limb\s*loss|amputat).*low\s+voltage', "Electrical contact burns Low voltage with limb loss"),
+        (r'low\s+voltage.*(?:electr|burn|contact)', "Electrical contact burns Low voltage"),
+        (r'(?:electr|contact).*burn.*low\s+voltage', "Electrical contact burns Low voltage"),
+        # Ortho compound
+        (r'total\s+knee\s+replacement', "Total Knee Replacement"),
+        (r'total\s+hip\s+replacement', "Total Hip Replacement"),
+        (r'total\s+shoulder\s+replacement', "Total Shoulder Replacement"),
+        (r'coronary\s+artery\s+bypass', "CABG"),
+        (r'severe\s+sepsis', "Severe Sepsis"),
+        (r'septic\s+shock', "Septic Shock"),
+    ]
+    
+    compound_matched = set()
+    for pattern, standard in compound_clinical_map:
+        if re.search(pattern, t, flags=re.IGNORECASE):
+            keywords.append(standard)
+            compound_matched.add(standard.lower())
+    
+    # ── Phase 2: TBSA percentage extraction ─────────────────────────────────
+    tbsa_match = re.search(r'(\d+)\s*%\s*(?:tbsa|total\s+body\s+surface|body\s+surface)', t)
+    if not tbsa_match:
+        tbsa_match = re.search(r'(?:tbsa|total\s+body\s+surface)\s*(?:area)?\s*(?:of|:)?\s*(\d+)\s*%', t)
+    tbsa_pct = int(tbsa_match.group(1)) if tbsa_match else None
+    
+    # ── Phase 3: Simple keyword mapping (skip if compound already matched) ──
     clinical_keywords_map = {
         # Orthopedics
         "tkr": "Total Knee Replacement",
-        "total knee replacement": "Total Knee Replacement",
         "thr": "Total Hip Replacement",
-        "total hip replacement": "Total Hip Replacement",
         "fracture": "Fracture",
         "arthroplasty": "Arthroplasty",
         
@@ -2101,7 +2145,6 @@ def _deterministic_keyword_extractor(query: str) -> dict:
         "ptca": "PTCA",
         "angioplasty": "PTCA",
         "cabg": "CABG",
-        "coronary artery bypass": "CABG",
         "angiography": "Coronary Angiography",
         "myocardial infarction": "Myocardial Infarction",
         "heart attack": "Myocardial Infarction",
@@ -2123,38 +2166,61 @@ def _deterministic_keyword_extractor(query: str) -> dict:
         "kidney transplant": "Renal Transplant",
         "kidney stone": "Renal Calculi",
         
-        # Burns
+        # Burns (simple — compound already handled above)
+        "flame burns": "Flame burns",
+        "thermal burns": "Thermal burns",
+        "chemical burns": "Chemical burns",
+        "scald burns": "Scald burns",
         "burns": "Burns",
-        "thermal burns": "Burns",
         
-        # Gynecology
+        # Gynecology / Obstetrics
         "hysterectomy": "Hysterectomy",
+        "c-section": "Caesarean Delivery",
+        "cesarean": "Caesarean Delivery",
+        "caesarean": "Caesarean Delivery",
         
-        # Medical / Supportive
-        "blood transfusion": "Blood Transfusion",
-        "transfusion": "Blood Transfusion",
+        # Medical / Supportive (these are always SECONDARY to primary disease)
+        "sepsis": "Sepsis",
+        "septicemia": "Sepsis",
         "anemia": "Anemia",
         "anaemia": "Anemia",
         "thalassemia": "Thalassemia",
-        "sepsis": "Sepsis",
-        "septicemia": "Sepsis",
-        "icu": "ICU Stay",
-        "ventilator": "Ventilator Support",
-        "extended los": "Extended LOS",
     }
     
     for term, standard in clinical_keywords_map.items():
+        # Skip if compound already matched this concept
+        if standard.lower() in compound_matched:
+            continue
+        # For burns: if TBSA was matched and compound already added a burn keyword, skip
+        if "burn" in standard.lower() and any("burn" in c for c in compound_matched):
+            continue
         pattern = r'\b' + re.escape(term) + r'\b'
         if re.search(pattern, t, flags=re.IGNORECASE):
+            # Append TBSA% to burn keywords if available
+            if "burn" in standard.lower() and tbsa_pct is not None:
+                standard = f"{standard} {tbsa_pct}% TBSA"
             keywords.append(standard)
             
-    # Deduplicate
+    # Deduplicate while preserving order
     seen = set()
     deduped = []
     for k in keywords:
         if k.lower() not in seen:
             seen.add(k.lower())
             deduped.append(k)
+    
+    # ── Phase 4: Enforce primary-disease-first ordering ─────────────────────
+    # Supportive/add-on terms must never be first
+    _SUPPORTIVE_TERMS = {"blood transfusion", "transfusion", "icu stay", "ventilator support", 
+                          "extended los", "blood component"}
+    if len(deduped) > 1:
+        first_is_supportive = deduped[0].lower() in _SUPPORTIVE_TERMS
+        if first_is_supportive:
+            # Move first supportive to end, promote first non-supportive
+            supportive = deduped[0]
+            non_supportive = [k for k in deduped if k.lower() not in _SUPPORTIVE_TERMS]
+            supportive_all = [k for k in deduped if k.lower() in _SUPPORTIVE_TERMS]
+            deduped = non_supportive + supportive_all
             
     # Fallback to query if empty
     if not deduped:
@@ -2204,6 +2270,12 @@ CRITICAL RULES:
 2. If the user mentions multiple conditions (e.g., "heart attack and kidney stone"), return ONE package keyword for the first, and ONE for the second.
 3. If the user's input is a layman term (e.g. "heart attack"), translate it to medical terminology. If the user's input is ALREADY a valid medical diagnosis or procedure (e.g. "Anemia", "Sepsis", "Appendectomy"), keep it exactly as-is. NEVER force a diagnosis to become a treatment (e.g., do NOT translate "Anemia" into "Blood Transfusion").
 4. EXCLUDE hospital stay details, ward types, ICU stays/days, or facility tiers (e.g., "private hospital", "2 days ICU", "ward stay") from the "keywords" list. These are supportive accommodations, not primary procedures/treatments.
+5. PRESERVE CLINICAL QUANTIFIERS in keywords — TBSA percentages, voltage levels (high/low), laterality (bilateral/unilateral), severity grades, and body regions MUST be included inline.
+6. COMPOUND CONDITIONS = SINGLE KEYWORD: When burn type + severity/complication form ONE clinical package (e.g., "high voltage electrical burns with limb loss"), output it as a SINGLE keyword, NOT split into separate keywords.
+7. PRIMARY DISEASE FIRST: The first keyword MUST be the primary disease/procedure. Supportive procedures (blood transfusion, ICU, ventilator, extended LOS) must NEVER be the first keyword — they go after the primary condition if mentioned at all.
+8. For orthopedic procedures, preserve the EXACT procedure name: "Total Knee Replacement" not "Arthroplasty", "Total Hip Replacement" not "Joint Replacement".
+9. PATIENT TYPE EXTRACTION: If the query mentions "child", "infant", "toddler", "baby", "neonate", "paediatric", "pediatric", or an age under 18 (e.g., "4 year old", "5yr"), you MUST output patient_type as "Pediatric". Otherwise, output "Adult".
+10. SPECIFIC BURN TYPES: Distinguish between "Flame burns", "Thermal burns", "Scald burns" (hot water/liquids), "Chemical burns", and "Electrical burns". Do not default all burns to thermal/flame.
 
 AVAILABLE SPECIALTIES:
 {specialties_str}
@@ -2214,8 +2286,14 @@ SAMPLE PACKAGE/PROCEDURE NAMES (use these as reference for keyword extraction):
 EXAMPLES:
 "heart attack" → {{"summary": "Acute Myocardial Infarction", "msso_instructions": "Admit under Cardiology. Book PTCA package.", "keywords": ["PTCA"], "patient_type": "Adult"}}
 "kidney stone" → {{"summary": "Renal Calculi", "msso_instructions": "Admit under Urology. Book PCNL or Ureteroscopy.", "keywords": ["PCNL"], "patient_type": "Adult"}}
-"Patient burn from fire 40% body and broken leg" → {{"summary": "40% Thermal Burns & Fracture", "msso_instructions": "Admit under Plastic Surgery and Orthopedics. Book Thermal Burns and Fracture.", "keywords": ["Thermal burns", "Fracture"], "patient_type": "Adult"}}
-"anemia" → {{"summary": "Anemia", "msso_instructions": "Admit under Medicine. Book Medical Management for Anemia.", "keywords": ["Anemia"], "patient_type": "Adult"}}
+"Flame burns with 35% total body surface area in adult patient" → {{"summary": "35% TBSA Flame Burns", "msso_instructions": "Admit under Plastic Surgery. Book Flame Burns 35% TBSA package.", "keywords": ["Flame burns 35% TBSA"], "patient_type": "Adult"}}
+"High voltage electrical burns with limb loss and amputation" → {{"summary": "HV Electrical Burns with Limb Loss", "msso_instructions": "Admit under Plastic Surgery. Book Electrical contact burns High voltage with limb loss.", "keywords": ["Electrical contact burns High voltage with limb loss"], "patient_type": "Adult"}}
+"bilateral total knee replacement for osteoarthritis" → {{"summary": "Bilateral TKR for OA", "msso_instructions": "Admit under Orthopedics. Book Total Knee Replacement.", "keywords": ["Total Knee Replacement"], "patient_type": "Adult"}}
+"Severe sepsis with blood transfusion and 3 days ICU" → {{"summary": "Severe Sepsis requiring ICU", "msso_instructions": "Admit under Medicine/ICU. Book Severe Sepsis package.", "keywords": ["Severe Sepsis"], "patient_type": "Adult"}}
+"CABG with 3 vessel disease" → {{"summary": "CABG 3-vessel", "msso_instructions": "Admit under CTVS. Book CABG package.", "keywords": ["CABG"], "patient_type": "Adult"}}
+"Appendicitis in child" → {{"summary": "Pediatric Appendicitis", "msso_instructions": "Admit under Pediatric Surgery. Book Appendicectomy.", "keywords": ["Appendicectomy"], "patient_type": "Pediatric"}}
+"Scald burns 30% TBSA on a 4yr child" → {{"summary": "30% TBSA Scald Burns in Child", "msso_instructions": "Admit under Plastic Surgery/Pediatrics. Book Scald burns 30% TBSA package.", "keywords": ["Scald burns 30% TBSA"], "patient_type": "Pediatric"}}
+"Planned repeat C-section" → {{"summary": "Repeat Caesarean Section", "msso_instructions": "Admit under Obstetrics. Book Caesarean Delivery.", "keywords": ["Caesarean Delivery"], "patient_type": "Adult"}}
 
 Input: "{query}"
 
@@ -2243,6 +2321,17 @@ Return ONLY valid JSON in this format: {{"summary": "...", "msso_instructions": 
 
         # Keep the exact medical keywords generated by the AI
         final_keywords = keywords
+        
+        # ── Post-LLM safety net: enforce primary-disease-first ordering ──
+        _SUPPORTIVE_KEYWORDS = {"blood transfusion", "blood component", "transfusion", 
+                                 "icu stay", "icu", "ventilator", "ventilator support",
+                                 "extended los", "extended length of stay"}
+        if len(final_keywords) > 1 and final_keywords[0].lower() in _SUPPORTIVE_KEYWORDS:
+            non_supportive = [k for k in final_keywords if k.lower() not in _SUPPORTIVE_KEYWORDS]
+            supportive = [k for k in final_keywords if k.lower() in _SUPPORTIVE_KEYWORDS]
+            if non_supportive:
+                final_keywords = non_supportive + supportive
+                logger.info("Post-LLM reorder: moved supportive keyword '%s' after primary", supportive)
         
         # Use the clinical summary from the LLM if available, fallback to the original query
         clinical_summary = parsed.get("summary", query)
@@ -2603,182 +2692,456 @@ async def _build_final_recommendation(flow: Any, packages: list[dict]) -> dict:
 # PRO INTERACTIVE MULTI-STEP SEARCH (DYNAMIC AI-DRIVEN)
 # ═══════════════════════════════════════════════════════════════════════
 
-class ProSelectionRequest(BaseModel):
-    option_id: str
-    notes: Optional[str] = ""
-    manual_package: Optional[Dict[str, Any]] = None
+# ── Token-Efficient Helpers ──────────────────────────────────────────
 
-async def _advance_pro_dynamic_flow(session_id: str, depth: int = 0) -> bool:
-    if depth > 3:
-        # Failsafe to prevent infinite Groq loops
-        flow, _, _, _ = await _get_or_reconstruct_flow(session_id)
-        flow.mark_complete()
-        return True
+# Keywords that indicate the query contains info relevant to each step type
+_STRAT_RELEVANT_KEYWORDS = frozenset({
+    "bilateral", "unilateral", "single", "double", "left", "right",
+    "mild", "moderate", "severe", "grade", "stage", "type",
+    "open", "laparoscopic", "lap", "minimally invasive",
+    "with deformity", "without deformity", "high risk", "low risk",
+    "primary", "revision", "redo", "recurrent",
+    "tbsa", "%", "percent",
+})
 
-    flow, _, matching_pkgs, _ = await _get_or_reconstruct_flow(session_id)
-    if not _async_groq_client:
-        return False
+_IMPLANT_RELEVANT_KEYWORDS = frozenset({
+    "implant", "stent", "des", "bms", "drug eluting", "bare metal",
+    "valve", "pacemaker", "prosthesis", "prosthetic",
+    "plate", "nail", "rod", "screw", "fixation",
+    "with implant", "without implant", "no implant",
+    "cemented", "uncemented", "hybrid",
+})
+
+_VARIANT_RELEVANT_KEYWORDS = frozenset({
+    "nabh", "non-nabh", "non nabh", "public", "private",
+    "government", "district", "tertiary",
+})
+
+def _query_contains_step_relevant_info(query: str, step_type: str) -> bool:
+    """Quick keyword check: does the query contain info relevant to this step type?
+    Used to skip LLM calls when the answer is obviously 'skip' or 'default'.
+    """
+    q = (query or "").lower()
+    if step_type == "stratification":
+        return any(kw in q for kw in _STRAT_RELEVANT_KEYWORDS)
+    elif step_type == "implant":
+        return any(kw in q for kw in _IMPLANT_RELEVANT_KEYWORDS)
+    elif step_type == "variant":
+        return any(kw in q for kw in _VARIANT_RELEVANT_KEYWORDS)
+    return True  # For unknown step types, assume relevant
+
+class ProAutoStepResponse(BaseModel):
+    selected_option_ids: list[str]
+
+@app.get("/pro-interactive-search/{session_id}/pro_auto_step", response_model=ProAutoStepResponse)
+async def get_pro_auto_step(session_id: str):
+    """Evaluates the current interactive step and returns the option IDs the AI would select."""
+    if session_id not in _interactive_flows:
+        raise HTTPException(404, "Session not found")
         
-    pkg_summary = "\n".join([f"- [{pkg_code(p)}] {pkg_name(p)[:100]} ({pkg_specialty(p)}) | ₹{pkg_rate(p)}" for p in matching_pkgs[:30]])
+    session_data = _interactive_flows[session_id]
+    flow = session_data["flow"]
+    request_data = session_data["request"]
     
-    chat_history_str = f"USER INITIAL QUERY: {flow.query}\n"
-    for i, step in enumerate(flow.steps):
-        if step.user_selection:
-            opt_id = step.user_selection.get("id")
-            opt_label = str(opt_id)
-            if hasattr(step, "options"):
-                for o in step.options:
-                    o_id = o.get("id") if isinstance(o, dict) else getattr(o, "id", None)
-                    if o_id == opt_id:
-                        opt_label = o.get("label") if isinstance(o, dict) else getattr(o, "label", str(opt_id))
-                        break
-            chat_history_str += f"AI ASKED: {step.step_name} - {step.description}\n"
-            chat_history_str += f"USER SELECTED: {opt_label}\n"
-            if step.step_name == "Main Package Selected":
-                chat_history_str += f"[SYSTEM: THE MAIN PACKAGE HAS BEEN SUCCESSFULLY SELECTED. YOU MUST NOW SUGGEST ADD-ONS OR FINISH.]\n"
-    try:
-        print(f"=== CHAT HISTORY ===\n{chat_history_str}\n====================")
-    except Exception:
-        pass
-    prompt = f"""You are a PMJAY/MAA Yojana package selection AI for Pro Users.
-Your goal is to find the exact, best matching packages based on the doctor's input (history, symptoms, diagnosis) with the LEAST amount of questioning possible.
-
-Available matching packages:
-{pkg_summary}
-
-Chat History:
-{chat_history_str}
-
-
-TASK:
-1. DIRECT MATCHING FIRST: Analyze the chat history and the doctor's input. If the input strongly points to specific packages (or if there are 10 or fewer highly relevant packages), DO NOT ask any abstract questions. Immediately output action "NARROW_DOWN" and provide those EXACT packages as the options (label = package name, value = package code).
-2. ONLY ASK IF AMBIGUOUS: If there are many packages and the exact clinical path is unclear (e.g. "stomach pain" or "fracture"), ask exactly ONE targeted question to figure out the differentiating factor (e.g. body part, surgical vs medical, with/without implant). NEVER ask continuous, ambiguous questions.
-3. NEVER repeat a question that has already been asked in the chat history. If you are stuck or have already asked a question, simply present the best matching packages.
-4. MAA YOJANA RULES: Keep MAA Yojana / PMJAY business rules in mind (e.g., if a major surgery is indicated, minor related procedures shouldn't be primary; respect phase requirements for burns).
-5. If you have narrowed it down to exactly one main package, output action: "SELECT_MAIN" and provide the selected_package_code.
-6. If the chat history shows [SYSTEM: THE MAIN PACKAGE HAS BEEN SUCCESSFULLY SELECTED...], DO NOT output "SELECT_MAIN" again. Instead, ask if they need add-ons (like Blood Transfusion, ICU) or output FINISH. Output action: "SUGGEST_ADDON" and provide add-on options.
-7. If all is done (no more add-ons needed, or the user skips/declines), output action: "FINISH".
-
-CRITICAL:
-- ALWAYS include a "Skip / Continue" option if you are asking for Add-ons.
-- Output ONLY raw valid JSON matching this schema:
-{{
-  "action": "NARROW_DOWN" | "SELECT_MAIN" | "SUGGEST_ADDON" | "FINISH",
-  "question": "The question to ask the user (if just listing exact packages, set this to 'Please select the specific package:')",
-  "options": [
-      {{
-          "label": "Option label (e.g. Exact Package Name OR a category like 'Unilateral')", 
-          "value": "internal_value OR package code",
-          "description": "Brief description or specialty/rate"
-      }}
-  ],
-  "selected_package_code": "CODE" // (only if SELECT_MAIN or FINISH)
-}}
-"""
-    try:
-        content = ""
+    if flow.flow_complete:
+        return ProAutoStepResponse(selected_option_ids=[])
         
-        # Try DeepSeek API first for Pro users
-        if DEEPSEEK_API_KEY and _async_deepseek_client:
-            try:
-                resp = await _async_deepseek_client.chat.completions.create(
-                    model=DEEPSEEK_MODEL,
-                    messages=[{"role": "user", "content": prompt}],
-                    stream=False,
-                    reasoning_effort="high",
-                    temperature=0.0,
-                    response_format={"type": "json_object"},
-                    extra_body={"thinking": {"type": "enabled"}},
-                    timeout=3.0
-                )
-                content = resp.choices[0].message.content
-            except Exception as d_err:
-                logger.warning(f"DeepSeek request error: {d_err}")
-                
-        # Fallback to Groq
-        if not content and _async_groq_client:
-            logger.info("Falling back to Groq API...")
-            resp_groq = await _async_groq_client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.0,
-                response_format={"type": "json_object"},
-                timeout=3.0
+    # 1. Retrieve or run smart search
+    smart_res = session_data.get("smart_res")
+    if not smart_res:
+        smart_req = SmartSearchRequest(
+            query=request_data.get("query", ""),
+            procedure=request_data.get("procedure", ""),
+            disease=request_data.get("disease", ""),
+            symptoms=request_data.get("symptoms", []),
+            patient_age=request_data.get("patient_age", 0),
+            patient_gender=request_data.get("patient_gender", ""),
+            patient_type=request_data.get("patient_type", ""),
+            scheme=request_data.get("scheme", ""),
+            limit=50
+        )
+        smart_res = await smart_search(smart_req)
+        session_data["smart_res"] = smart_res
+
+    _load_packages_cache()
+    query_text = request_data.get("query", "")
+    current_step = flow.steps[flow.current_step]
+    options = current_step.options
+
+    is_primary = current_step.context.get("is_primary_selection", False)
+    is_term = current_step.context.get("is_term_selection", False)
+    is_variant = current_step.context.get("is_variant_selection", False)
+    is_consolidated_addons = current_step.context.get("is_consolidated_addons", False)
+
+    real_strat_opts = [opt for opt in options if opt["id"].startswith("strat_") and opt["id"] not in ("strat_skip", "manual_add_strat")]
+    real_implant_opts = [opt for opt in options if opt["id"].startswith("implant_") and opt["id"] not in ("implant_skip", "manual_add_implant")]
+    is_strat = len(real_strat_opts) > 0
+    is_implant = len(real_implant_opts) > 0
+
+    selected_options = []
+
+    if is_primary or is_term:
+        # ── Cross-validated package selection with add-on guard ──
+        valid_opts = []
+        for opt in options:
+            if opt["id"] in ("package_skip", "manual_add_main"):
+                continue
+            opt_name = (opt.get("description", "") + " " + opt.get("label", "")).upper()
+            if is_primary and any(tag in opt_name for tag in ("[ADD-ON", "[ADD ON", "ADD-ON PKG", "ADDON")):
+                continue
+            valid_opts.append(opt)
+        
+        recommended_code = None
+        if is_primary:
+            recommended_code = smart_res.main_package.package_code if (smart_res and smart_res.main_package) else None
+        else:
+            for add in (smart_res.suggested_addons if smart_res else []):
+                if any(opt.get("code") == add.package_code for opt in options):
+                    recommended_code = add.package_code
+                    break
+        if recommended_code:
+            selected_option = next((opt for opt in valid_opts if opt.get("code") == recommended_code), None)
+            # Cross-validation
+            if selected_option and valid_opts and is_primary:
+                top3_codes = {opt.get("code") for opt in valid_opts[:3]}
+                if recommended_code not in top3_codes:
+                    selected_option = valid_opts[0]
+            if selected_option: selected_options.append(selected_option)
+        if not selected_options and valid_opts:
+            selected_options.append(valid_opts[0])
+
+    elif is_strat:
+        selected_option = None
+        if _query_contains_step_relevant_info(query_text, "stratification"):
+            selected_option = await _check_query_for_choice(
+                query=query_text, options=options,
+                step_type="stratification", client=_async_groq_client
             )
-            content = resp_groq.choices[0].message.content
-            
-        if not content:
-            raise ValueError("Both DeepSeek and Groq APIs failed to return content.")
-            
-        # Parse JSON
-        # Some reasoning models might output text before JSON or in a reasoning block
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0].strip()
-        ai_res = json.loads(content)
-        action = ai_res.get("action")
+        if not selected_option:
+            skip_opt = next((opt for opt in options if "skip" in opt["id"]), None)
+            if skip_opt:
+                selected_option = skip_opt
+            elif real_strat_opts:
+                selected_option = real_strat_opts[0]
+        if selected_option: selected_options.append(selected_option)
+
+    elif is_implant:
+        selected_option = None
+        has_implant_info = _query_contains_step_relevant_info(query_text, "implant")
+        procedure_needs_implant = _procedure_implies_implant(query_text)
         
-        from tools.smart_search_flow import SearchStep
+        if has_implant_info:
+            selected_option = await _check_query_for_choice(
+                query=query_text, options=options,
+                step_type="implant", client=_async_groq_client
+            )
+        if not selected_option:
+            if procedure_needs_implant and real_implant_opts:
+                selected_option = real_implant_opts[0]
+            else:
+                skip_opt = next((opt for opt in options if "skip" in opt["id"]), None)
+                if skip_opt:
+                    selected_option = skip_opt
+                elif real_implant_opts:
+                    selected_option = real_implant_opts[0]
+        if selected_option: selected_options.append(selected_option)
+
+    elif is_variant:
+        selected_option = None
+        if _query_contains_step_relevant_info(query_text, "variant"):
+            selected_option = await _check_query_for_choice(
+                query=query_text, options=options,
+                step_type="variant", client=_async_groq_client
+            )
+        if not selected_option:
+            real_variants = [opt for opt in options if opt["id"].startswith("variant_")]
+            if real_variants:
+                selected_option = real_variants[0]
+            else:
+                selected_option = options[0] if options else None
+        if selected_option: selected_options.append(selected_option)
+
+    elif is_consolidated_addons:
+        matched_options = await _check_query_for_multiple_choices(
+            query=query_text, options=options,
+            step_type="supportive care / stay duration",
+            client=_async_groq_client
+        )
+        if matched_options:
+            for opt in matched_options:
+                selected_options.append(opt)
         
-        if action == "FINISH":
-            flow.mark_complete()
-            return True
+        selected_option = next((opt for opt in options if opt["id"] == "addon_skip"), None)
+        if selected_option: selected_options.append(selected_option)
+        
+    if not selected_options:
+        selected_option = next((opt for opt in options if "skip" in opt["id"]), None)
+        if not selected_option and options:
+            real_opts = [opt for opt in options if not opt["id"].startswith("manual_add")]
+            selected_option = real_opts[0] if real_opts else options[0]
+        if selected_option: selected_options.append(selected_option)
             
-        elif action == "SELECT_MAIN":
-            code = ai_res.get("selected_package_code")
-            if code:
-                p_label = "Selected Package"
-                p_rate = 0
-                p_desc = ""
-                for p in matching_pkgs:
-                    if pkg_code(p) == code:
-                        p_label = pkg_name(p)
-                        p_rate = pkg_rate(p)
-                        p_desc = pkg_specialty(p)
+    return ProAutoStepResponse(selected_option_ids=[opt["id"] for opt in selected_options])
+
+
+# Procedures that clinically require implants — auto-include the implant step
+_PROCEDURES_IMPLYING_IMPLANTS = {
+    "ptca", "angioplasty", "pci", "stent", "coronary stenting",
+    "total knee replacement", "tkr", "total hip replacement", "thr",
+    "total shoulder replacement", "arthroplasty",
+    "pacemaker", "valve replacement", "aortic valve", "mitral valve",
+    "cabg",  # Sometimes uses grafts
+    "fixation", "plating", "nailing", "intramedullary",
+}
+
+def _procedure_implies_implant(query: str) -> bool:
+    """Check if the procedure in the query clinically requires an implant."""
+    q = (query or "").lower()
+    return any(proc in q for proc in _PROCEDURES_IMPLYING_IMPLANTS)
+
+async def _advance_pro_standard_flow(session_id: str) -> InteractiveSearchStartResponse:
+    if session_id not in _interactive_flows:
+        raise HTTPException(404, "Session not found")
+        
+    session_data = _interactive_flows[session_id]
+    flow = session_data["flow"]
+    all_packages = session_data["all_packages"]
+    request_data = session_data["request"]
+    sels = session_data.get("selections_list", [])
+    
+    # 1. Retrieve or run smart search
+    smart_res = session_data.get("smart_res")
+    if not smart_res:
+        smart_req = SmartSearchRequest(
+            query=request_data.get("query", ""),
+            procedure=request_data.get("procedure", ""),
+            disease=request_data.get("disease", ""),
+            symptoms=request_data.get("symptoms", []),
+            patient_age=request_data.get("patient_age", 0),
+            patient_gender=request_data.get("patient_gender", ""),
+            patient_type=request_data.get("patient_type", ""),
+            scheme=request_data.get("scheme", ""),
+            limit=50
+        )
+        smart_res = await smart_search(smart_req)
+        session_data["smart_res"] = smart_res
+        
+    _load_packages_cache()
+    
+    asked = False
+    from tools.smart_search_flow import process_step_selection
+    
+    max_iterations = 20
+    iterations = 0
+    
+    query_text = request_data.get("query", "")
+    
+    while not flow.flow_complete and iterations < max_iterations:
+        iterations += 1
+        current_step = flow.steps[flow.current_step]
+        options = current_step.options
+        
+        is_primary = current_step.context.get("is_primary_selection", False)
+        is_term = current_step.context.get("is_term_selection", False)
+        is_variant = current_step.context.get("is_variant_selection", False)
+        is_consolidated_addons = current_step.context.get("is_consolidated_addons", False)
+        
+        real_strat_opts = [opt for opt in options if opt["id"].startswith("strat_") and opt["id"] not in ("strat_skip", "manual_add_strat")]
+        real_implant_opts = [opt for opt in options if opt["id"].startswith("implant_") and opt["id"] not in ("implant_skip", "manual_add_implant")]
+        is_strat = len(real_strat_opts) > 0
+        is_implant = len(real_implant_opts) > 0
+        
+        selected_option = None
+        
+        if is_primary or is_term:
+            # ── Cross-validated package selection with add-on guard ──
+            from tools.smart_search_flow import _is_addon_package as _flow_is_addon
+            
+            # Build list of valid options (exclude skip/manual/add-on-as-primary)
+            valid_opts = []
+            for opt in options:
+                if opt["id"] in ("package_skip", "manual_add_main"):
+                    continue
+                # Block add-on packages from being selected as PRIMARY
+                opt_name = (opt.get("description", "") + " " + opt.get("label", "")).upper()
+                if is_primary and any(tag in opt_name for tag in ("[ADD-ON", "[ADD ON", "ADD-ON PKG", "ADDON")):
+                    logger.info("Pro: Blocking add-on package from primary: %s", opt.get("code"))
+                    continue
+                valid_opts.append(opt)
+            
+            recommended_code = None
+            if is_primary:
+                recommended_code = smart_res.main_package.package_code if (smart_res and smart_res.main_package) else None
+            else:
+                for add in (smart_res.suggested_addons if smart_res else []):
+                    if any(opt.get("code") == add.package_code for opt in options):
+                        recommended_code = add.package_code
                         break
                         
-                step_idx = len(flow.steps)
-                step = SearchStep(step_idx, "Main Package Selected", "AI automatically narrowed down to this package.", [
-                    {"id": f"package_{code}", "label": p_label, "description": p_desc, "rate": p_rate}
-                ])
-                flow.add_step(step)
-                flow.set_selection(step_idx, {"id": f"package_{code}"})
-                return await _advance_pro_dynamic_flow(session_id, depth=depth + 1)
+            if recommended_code:
+                selected_option = next((opt for opt in valid_opts if opt.get("code") == recommended_code), None)
                 
-        elif action in ("NARROW_DOWN", "SUGGEST_ADDON"):
-            opts = ai_res.get("options", [])
-            options_obj = []
-            for i, opt in enumerate(opts):
-                val = str(opt.get("value", f"opt_{i}"))
-                options_obj.append({
-                    "id": f"ai_opt_{val}",
-                    "label": str(opt.get("label", val)),
-                    "description": str(opt.get("description", "")),
-                    "rate": 0
+                # ── Cross-validation: verify AI pick is in flow's top 3 ranked options ──
+                if selected_option and valid_opts and is_primary:
+                    top3_codes = {opt.get("code") for opt in valid_opts[:3]}
+                    if recommended_code not in top3_codes:
+                        # AI recommended a package that's not in the flow's top 3
+                        # Prefer the flow's #1 (which is deterministically ranked by relevance score)
+                        logger.warning(
+                            "Pro: AI recommended %s but flow top-3 is %s — preferring flow #1: %s",
+                            recommended_code, top3_codes, valid_opts[0].get("code")
+                        )
+                        selected_option = valid_opts[0]
+                
+            if not selected_option and valid_opts:
+                selected_option = valid_opts[0]
+                    
+        elif is_strat:
+            # ── TOKEN-EFFICIENT: Check if query has stratification info first ──
+            if _query_contains_step_relevant_info(query_text, "stratification"):
+                selected_option = await _check_query_for_choice(
+                    query=query_text, options=options,
+                    step_type="stratification", client=_async_groq_client
+                )
+            if not selected_option:
+                # Smart default: auto-skip stratification when query has no relevant info
+                skip_opt = next((opt for opt in options if "skip" in opt["id"]), None)
+                if skip_opt:
+                    selected_option = skip_opt
+                    logger.info("Pro: Auto-skipping strat (no relevant query info)")
+                elif real_strat_opts:
+                    # Fallback: select first stratification option
+                    selected_option = real_strat_opts[0]
+                    logger.info("Pro: Defaulting to first strat option: %s", selected_option.get("id"))
+                
+        elif is_implant:
+            # ── TOKEN-EFFICIENT: Check if query mentions implant info OR procedure implies implant ──
+            has_implant_info = _query_contains_step_relevant_info(query_text, "implant")
+            procedure_needs_implant = _procedure_implies_implant(query_text)
+            
+            if has_implant_info:
+                selected_option = await _check_query_for_choice(
+                    query=query_text, options=options,
+                    step_type="implant", client=_async_groq_client
+                )
+            
+            if not selected_option:
+                if procedure_needs_implant and real_implant_opts:
+                    # Procedure clinically requires implant — auto-select first (most relevant)
+                    selected_option = real_implant_opts[0]
+                    logger.info("Pro: Auto-including implant (procedure implies it): %s", selected_option.get("id"))
+                else:
+                    # No implant info and procedure doesn't need it — skip
+                    skip_opt = next((opt for opt in options if "skip" in opt["id"]), None)
+                    if skip_opt:
+                        selected_option = skip_opt
+                        logger.info("Pro: Auto-skipping implant (no relevant query info)")
+                    elif real_implant_opts:
+                        selected_option = real_implant_opts[0]
+                        logger.info("Pro: Defaulting to first implant option: %s", selected_option.get("id"))
+                
+        elif is_variant:
+            # ── TOKEN-EFFICIENT: Check if query mentions variant info ──
+            if _query_contains_step_relevant_info(query_text, "variant"):
+                selected_option = await _check_query_for_choice(
+                    query=query_text, options=options,
+                    step_type="variant", client=_async_groq_client
+                )
+            if not selected_option:
+                # Smart default: select first variant (most common/cheapest rate)
+                real_variants = [opt for opt in options if opt["id"].startswith("variant_")]
+                if real_variants:
+                    selected_option = real_variants[0]
+                    logger.info("Pro: Defaulting to first variant: %s", selected_option.get("id"))
+                else:
+                    selected_option = options[0] if options else None
+                
+        elif is_consolidated_addons:
+            # ── Deterministic first, then LLM for add-ons ──
+            matched_options = await _check_query_for_multiple_choices(
+                query=query_text, options=options,
+                step_type="supportive care / stay duration",
+                client=_async_groq_client
+            )
+            if matched_options:
+                for opt in matched_options:
+                    if not any(s.get("id") == opt["id"] for s in sels):
+                        sels.append({
+                            "id": opt["id"],
+                            "notes": "Pro auto-selected",
+                            "manual_package": None
+                        })
+                        process_step_selection(flow, opt, all_packages)
+            
+            selected_option = next((opt for opt in options if opt["id"] == "addon_skip"), None)
+            
+        # ── Fallback: always pick skip or first option (never leave stuck) ──
+        if not selected_option:
+            selected_option = next((opt for opt in options if "skip" in opt["id"]), None)
+            if not selected_option and options:
+                # Filter out manual_add options and pick first real option
+                real_opts = [opt for opt in options if not opt["id"].startswith("manual_add")]
+                selected_option = real_opts[0] if real_opts else options[0]
+                
+        if selected_option:
+            if not any(s.get("id") == selected_option["id"] for s in sels):
+                sels.append({
+                    "id": selected_option["id"],
+                    "notes": "Pro auto-selected",
+                    "manual_package": None
                 })
+            session_data["selections_list"] = sels
             
-            options_obj.append({
-                "id": "manual_add_skip",
-                "label": "Skip / Add Manually",
-                "description": "Skip this question",
-                "rate": 0,
-                "rank": 9999
-            })
-            
-            step_idx = len(flow.steps)
-            question_text = ai_res.get("question")
-            if not question_text or question_text.strip() == "":
-                question_text = "Please select the specific package:"
+            success, err = process_step_selection(flow, selected_option, all_packages)
+            if not success:
+                logger.warning("Pro: Step selection failed: %s — retrying with skip", err)
+                # Try skip option as last resort
+                skip_opt = next((opt for opt in options if "skip" in opt["id"]), None)
+                if skip_opt and skip_opt["id"] != selected_option["id"]:
+                    sels[-1] = {"id": skip_opt["id"], "notes": "Pro auto-selected (fallback)", "manual_package": None}
+                    success, err = process_step_selection(flow, skip_opt, all_packages)
+                if not success:
+                    asked = True
+                    break
                 
-            step = SearchStep(step_idx, question_text, "", options_obj)
-            flow.add_step(step)
-            return True
+            _sync_session_db(session_id, flow, sels, pt_type=request_data.get("patient_type", ""), scheme=request_data.get("scheme", ""))
+            _auto_advance_single_option_steps(flow, all_packages)
+        else:
+            asked = True
+            break
             
-    except Exception as e:
-        logger.error("Pro AI flow error: %s", e)
-        return False
+    _sync_session_db(session_id, flow, sels, pt_type=request_data.get("patient_type", ""), scheme=request_data.get("scheme", ""))
+    
+    if asked:
+        current_step = flow.steps[flow.current_step]
+        return InteractiveSearchStartResponse(
+            session_id=session_id,
+            query=request_data.get("query", ""),
+            parsed_terms=flow.parsed_terms,
+            current_step=_step_to_response(current_step),
+            message="Please provide the missing clinical details to complete selection.",
+            status="interactive",
+            final_recommendation=None
+        )
+    else:
+        final_rec_dict = await _build_final_recommendation(flow, all_packages)
+        flow.final_recommendation = final_rec_dict
+        _sync_session_db(session_id, flow, sels, pt_type=request_data.get("patient_type", ""), scheme=request_data.get("scheme", ""))
+        return InteractiveSearchStartResponse(
+            session_id=session_id,
+            query=request_data.get("query", ""),
+            parsed_terms=flow.parsed_terms,
+            current_step=None,
+            message="AI successfully matched and selected all package details.",
+            status="complete",
+            final_recommendation=final_rec_dict
+        )
 
 def _deterministic_choice_matcher(query: str, options: list[dict], step_type: str) -> Optional[dict]:
     q = (query or "").lower()
+    
+    # Filter to only real options (exclude skip/manual)
+    real_options = [opt for opt in options if "skip" not in str(opt.get("id", "")).lower() and not str(opt.get("id", "")).startswith("manual_add")]
     
     # 1. Skip / No Implant detection
     if "without implant" in q or "no implant" in q:
@@ -2795,8 +3158,15 @@ def _deterministic_choice_matcher(query: str, options: list[dict], step_type: st
             desc = str(opt.get("description", "")).lower()
             if "bilateral" in label or "bilateral" in desc:
                 return opt
+    elif "unilateral" in q or "single" in q:
+        for opt in options:
+            label = str(opt.get("label", "")).lower()
+            desc = str(opt.get("description", "")).lower()
+            if "unilateral" in label or "unilateral" in desc or "single" in label or "primary knee replacement" in label:
+                return opt
     else:
-        # Check if unilateral / primary / single is specified
+        # Default: if bilateral/unilateral options exist but query doesn't specify,
+        # prefer unilateral (most common)
         has_bilateral_opt = any("bilateral" in str(opt.get("label", "")).lower() for opt in options)
         if has_bilateral_opt:
             for opt in options:
@@ -2840,8 +3210,40 @@ def _deterministic_choice_matcher(query: str, options: list[dict], step_type: st
             if "private" in label:
                 return opt
 
-    # 5. General keyword matching
-    # Check if any option code is in the query
+    # 5. Severity / Grade / Risk matching
+    for severity in ["severe", "moderate", "mild", "high risk", "low risk"]:
+        if severity in q:
+            for opt in real_options:
+                label = str(opt.get("label", "")).lower()
+                desc = str(opt.get("description", "")).lower()
+                if severity in label or severity in desc:
+                    return opt
+
+    # 6. Stent type matching (Cardiology)
+    if "drug eluting" in q or "des" in q.split():
+        for opt in real_options:
+            label = str(opt.get("label", "")).lower()
+            if "drug eluting" in label or "des" in label.split():
+                return opt
+    if "bare metal" in q or "bms" in q.split():
+        for opt in real_options:
+            label = str(opt.get("label", "")).lower()
+            if "bare metal" in label or "bms" in label.split():
+                return opt
+
+    # 7. Cemented vs Uncemented (Orthopedics)
+    if "cemented" in q and "uncemented" not in q:
+        for opt in real_options:
+            label = str(opt.get("label", "")).lower()
+            if "cemented" in label and "uncemented" not in label:
+                return opt
+    elif "uncemented" in q:
+        for opt in real_options:
+            label = str(opt.get("label", "")).lower()
+            if "uncemented" in label:
+                return opt
+
+    # 8. General keyword matching — check if any option code is in the query
     for opt in options:
         code = str(opt.get("code", "")).strip().lower()
         if code and len(code) > 4 and code in q:
@@ -2853,6 +3255,17 @@ def _deterministic_multiple_choices_matcher(query: str, options: list[dict], ste
     q = (query or "").lower()
     matched = []
     
+    # ── Extract numeric day counts from query (e.g., "5 days ICU", "3 day ward") ──
+    day_matches = re.findall(r'(\d+)\s*(?:days?|nights?)\s*(icu|ward|general|private|stay)?', q)
+    requested_icu_days = 0
+    requested_ward_days = 0
+    for count_str, ward_type in day_matches:
+        days_val = int(count_str)
+        if "icu" in (ward_type or ""):
+            requested_icu_days = days_val
+        else:
+            requested_ward_days = days_val
+    
     for opt in options:
         opt_id = str(opt.get("id", "")).lower()
         if "skip" in opt_id or "manual_add" in opt_id:
@@ -2863,15 +3276,27 @@ def _deterministic_multiple_choices_matcher(query: str, options: list[dict], ste
         
         # Blood transfusion
         if "transfusion" in combined or "blood" in combined or "packed cell" in combined or "platelet" in combined:
-            if "transfusion" in q or "blood" in q or "packed cell" in q or "platelet" in q or "sdp" in q:
+            if "transfusion" in q or "blood" in q or "packed cell" in q or "platelet" in q or "sdp" in q or "ffp" in q:
                 matched.append(opt)
                 continue
                 
-        # ICU
+        # ICU (with day-count matching)
         if "icu" in combined or "intensive care" in combined:
             if "icu" in q or "intensive care" in q:
-                matched.append(opt)
-                continue
+                # If specific day count requested, try to match
+                if requested_icu_days > 0:
+                    day_in_label = re.search(r'(\d+)\s*(?:days?|nights?)', combined)
+                    if day_in_label:
+                        label_days = int(day_in_label.group(1))
+                        if label_days == requested_icu_days:
+                            matched.append(opt)
+                            continue
+                    else:
+                        matched.append(opt)
+                        continue
+                else:
+                    matched.append(opt)
+                    continue
                 
         # Ventilator
         if "ventilator" in combined or "ventilation" in combined or "respiratory support" in combined:
@@ -2884,6 +3309,23 @@ def _deterministic_multiple_choices_matcher(query: str, options: list[dict], ste
             if "extended los" in q or "extended length" in q or "extended stay" in q or " anticoagulation " in q or "dvt" in q:
                 matched.append(opt)
                 continue
+
+        # General/Private Ward (with day-count matching)
+        if ("general ward" in combined or "ward stay" in combined or "ward" in combined) and "icu" not in combined:
+            if "general ward" in q or "ward stay" in q or ("ward" in q and "icu" not in q):
+                if requested_ward_days > 0:
+                    day_in_label = re.search(r'(\d+)\s*(?:days?|nights?)', combined)
+                    if day_in_label:
+                        label_days = int(day_in_label.group(1))
+                        if label_days == requested_ward_days:
+                            matched.append(opt)
+                            continue
+                    else:
+                        matched.append(opt)
+                        continue
+                else:
+                    matched.append(opt)
+                    continue
                 
     return matched
 
@@ -2911,26 +3353,21 @@ async def _check_query_for_choice(query: str, options: list[dict], step_type: st
     # Find if there is a skip option
     skip_option = next((opt for opt in options if "skip" in str(opt.get("id", "")).lower()), None)
     
-    prompt = f"""You are a clinical decision support system.
-The user query / clinical history is:
-"{query}"
+    # ── Compact prompt: send only id+label (not full description/rate) to save tokens ──
+    compact_options = [{"id": o["id"], "label": o.get("label", "")[:60]} for o in filtered_options]
+    compact_str = json.dumps(compact_options)
+    
+    prompt = f"""Clinical decision support. Query: "{query}"
+Choosing: "{step_type}". Options:
+{compact_str}
 
-We are currently choosing an option for: "{step_type}".
-The available options are:
-{options_str}
+Rules:
+1. If query specifies an option, return its id.
+2. If NO implant/stratification/supportive care needed, return "skip".
+3. If options are irrelevant to the patient's condition, return "skip".
+4. If ambiguous/insufficient info, return null.
 
-TASK:
-1. Check if the user query explicitly specifies which option is needed.
-2. If the user query indicates that NO implant, NO stratification, or NO supportive/stay packages are needed, return "skip" as the matched_id.
-3. If there is a clear clinical match or option specified, return the exact "id" of the matched option in the "matched_id" field.
-4. If none of the available options are clinically appropriate or relevant for the patient's main condition/procedure (e.g. options are for Burns/Cardiology but the patient has Appendectomy/General Surgery), return "skip" as the matched_id.
-5. If the query does NOT specify which option to select, lacks details to choose between them, or is ambiguous, return null.
-
-Return a JSON object:
-{{
-  "matched_id": "option_id" or "skip" or null,
-  "reason": "clinical matching reason"
-}}
+Return JSON: {{"matched_id": "id"|"skip"|null, "reason": "brief reason"}}
 """
     try:
         resp = await client.chat.completions.create(
@@ -2965,30 +3402,19 @@ async def _check_query_for_multiple_choices(query: str, options: list[dict], ste
         return []
     
     filtered_options = [
-        {"id": opt.get("id"), "label": opt.get("label"), "description": opt.get("description"), "rate": opt.get("rate")}
+        {"id": opt.get("id"), "label": opt.get("label", "")[:60]}
         for opt in options if not str(opt.get("id", "")).startswith("manual_add") and "skip" not in str(opt.get("id", "")).lower()
     ]
     if not filtered_options:
         return []
         
-    options_str = json.dumps(filtered_options, indent=2)
-    prompt = f"""You are a clinical decision support system.
-The user query / clinical history is:
-"{query}"
+    compact_str = json.dumps(filtered_options)
+    prompt = f"""Clinical decision support. Query: "{query}"
+Selecting add-ons for: "{step_type}". Options:
+{compact_str}
 
-We are selecting multiple supportive care packages / add-ons for: "{step_type}".
-The available options are:
-{options_str}
-
-TASK:
-1. Identify all options from the list that are explicitly requested or clinically required according to the user query (e.g. ICU stay, general ward stay, specific stay duration, blood transfusion, etc.).
-2. Return a list of their exact "id" values.
-3. If none of the options match the query or are clinically appropriate for the main procedure, return an empty list.
-
-Return a JSON object:
-{{
-  "matched_ids": ["id1", "id2", ...]
-}}
+Return ids of options explicitly requested or clinically required. Empty list if none match.
+Return JSON: {{"matched_ids": ["id1", ...]}}
 """
     try:
         resp = await client.chat.completions.create(
@@ -3018,184 +3444,9 @@ async def start_pro_interactive_search(request: InteractiveSearchStartRequest):
     # 1. Start standard search first to get parsed_terms and session setup
     res = await start_interactive_search(request)
     sid = res.session_id
-    session_data = _interactive_flows[sid]
-    flow = session_data["flow"]
-
-    # 2. Invoke AI smart search to directly match packages
-    smart_req = SmartSearchRequest(
-        query=request.query,
-        procedure=request.procedure,
-        disease=request.disease,
-        symptoms=request.symptoms,
-        patient_age=request.patient_age,
-        patient_gender=request.patient_gender,
-        patient_type=request.patient_type,
-        scheme=request.scheme,
-        limit=50
-    )
-
-    smart_res = await smart_search(smart_req)
-
-    _load_packages_cache()
-    all_packages = session_data["all_packages"]
-
-    # We will keep advancing the flow programmatically until it is either complete,
-    # or we encounter a step where details are missing and we need to ask the user.
-    asked = False
-    from tools.smart_search_flow import process_step_selection
     
-    max_iterations = 20
-    iterations = 0
-    
-    while not flow.flow_complete and iterations < max_iterations:
-        iterations += 1
-        current_step = flow.steps[flow.current_step]
-        options = current_step.options
-        
-        is_primary = current_step.context.get("is_primary_selection", False)
-        is_term = current_step.context.get("is_term_selection", False)
-        is_variant = current_step.context.get("is_variant_selection", False)
-        is_consolidated_addons = current_step.context.get("is_consolidated_addons", False)
-        
-        is_strat = any(opt["id"].startswith("strat_") for opt in options if opt["id"] not in ("strat_skip", "manual_add_strat"))
-        is_implant = any(opt["id"].startswith("implant_") for opt in options if opt["id"] not in ("implant_skip", "manual_add_implant"))
-        
-        selected_option = None
-        
-        if is_primary or is_term:
-            # For primary/term packages, match code from smart search
-            recommended_code = None
-            if is_primary:
-                recommended_code = smart_res.main_package.package_code if (smart_res and smart_res.main_package) else None
-            else:
-                # Find matching addon
-                for add in smart_res.suggested_addons:
-                    if any(opt.get("code") == add.package_code for opt in options):
-                        recommended_code = add.package_code
-                        break
-            
-            if recommended_code:
-                selected_option = next((opt for opt in options if opt.get("code") == recommended_code), None)
-            
-            # Fallback to first non-skip option if AI didn't recommend one but we don't want to stop here
-            if not selected_option and options:
-                valid_opts = [opt for opt in options if opt["id"] not in ("package_skip", "manual_add_main")]
-                if valid_opts:
-                    selected_option = valid_opts[0]
-                    
-        elif is_strat:
-            selected_option = await _check_query_for_choice(
-                query=request.query,
-                options=options,
-                step_type="stratification",
-                client=_async_groq_client
-            )
-            if not selected_option:
-                asked = True
-                break
-                
-        elif is_implant:
-            selected_option = await _check_query_for_choice(
-                query=request.query,
-                options=options,
-                step_type="implant",
-                client=_async_groq_client
-            )
-            if not selected_option:
-                asked = True
-                break
-                
-        elif is_variant:
-            selected_option = await _check_query_for_choice(
-                query=request.query,
-                options=options,
-                step_type="variant",
-                client=_async_groq_client
-            )
-            if not selected_option:
-                asked = True
-                break
-                
-        elif is_consolidated_addons:
-            matched_options = await _check_query_for_multiple_choices(
-                query=request.query,
-                options=options,
-                step_type="supportive care / stay duration",
-                client=_async_groq_client
-            )
-            if matched_options:
-                for opt in matched_options:
-                    sels = session_data.get("selections_list", [])
-                    if not any(s.get("id") == opt["id"] for s in sels):
-                        sels.append({
-                            "id": opt["id"],
-                            "notes": "Pro auto-selected",
-                            "manual_package": None
-                        })
-                        session_data["selections_list"] = sels
-                        process_step_selection(flow, opt, all_packages)
-            
-            # To advance past this step, we select the skip option
-            selected_option = next((opt for opt in options if opt["id"] == "addon_skip"), None)
-                
-        if not selected_option:
-            selected_option = next((opt for opt in options if "skip" in opt["id"]), None)
-            if not selected_option and options:
-                selected_option = options[0]
-                
-        if selected_option:
-            # Add to selections_list so frontend status works correctly
-            sels = session_data.get("selections_list", [])
-            sels.append({
-                "id": selected_option["id"],
-                "notes": "Pro auto-selected",
-                "manual_package": None
-            })
-            session_data["selections_list"] = sels
-            
-            success, err = process_step_selection(flow, selected_option, all_packages)
-            if not success:
-                asked = True
-                break
-            
-            # Sync session DB
-            _sync_session_db(sid, flow, sels, pt_type=request.patient_type)
-            _auto_advance_single_option_steps(flow, all_packages)
-        else:
-            asked = True
-            break
-
-    if asked:
-        current_step = flow.steps[flow.current_step]
-        return InteractiveSearchStartResponse(
-            session_id=sid,
-            query=res.query,
-            parsed_terms=res.parsed_terms,
-            current_step=_step_to_response(current_step),
-            message="Please provide the missing clinical details to complete selection.",
-            status="interactive",
-            final_recommendation=None
-        )
-    else:
-        final_rec_dict = await _build_final_recommendation(flow, all_packages)
-        flow.final_recommendation = final_rec_dict
-        _sync_session_db(sid, flow, session_data.get("selections_list", []), pt_type=request.patient_type, scheme=request.scheme)
-        
-        return InteractiveSearchStartResponse(
-            session_id=sid,
-            query=res.query,
-            parsed_terms=res.parsed_terms,
-            current_step=None,
-            message="AI successfully matched and selected all package details.",
-            status="complete",
-            final_recommendation=final_rec_dict
-        )
-
-class RecalculateRequest(BaseModel):
-    session_id: str
-    package_codes: list[str]
-    custom_rates: Optional[dict[str, float]] = None
-    package_types: Optional[dict[str, str]] = None
+    # 2. Advance the flow automatically using standard search steps
+    return await _advance_pro_standard_flow(sid)
 
 @app.post("/pro-interactive-search/recalculate")
 async def recalculate_pro_recommendation(req: RecalculateRequest):
@@ -3386,53 +3637,68 @@ Output ONLY raw valid JSON:
 
 @app.post("/pro-interactive-search/{session_id}/select")
 async def submit_pro_step_selection(session_id: str, selection: SelectionRequest):
-    from tools.smart_search_flow import SearchStep
     flow, all_pkgs, _, _ = await _get_or_reconstruct_flow(session_id)
-    step_num = flow.current_step
-    flow.set_selection(step_num, {"id": selection.option_id, "notes": selection.notes, "manual_package": selection.manual_package})
-    
-    sels = _interactive_flows[session_id].get("selections_list", [])
-    sels.append({"id": selection.option_id, "notes": selection.notes, "manual_package": selection.manual_package})
-    _interactive_flows[session_id]["selections_list"] = sels
-    
-    flow.current_step += 1
-    
-    # Intercept exact package selections to prevent AI looping
-    opt_val = str(selection.option_id).replace("ai_opt_", "").replace("package_", "")
-    selected_pkg = next((p for p in all_pkgs if pkg_code(p) == opt_val), None)
-    
-    if selected_pkg:
-        # The user clicked an exact package. Force SELECT_MAIN behavior.
-        p_label = pkg_name(selected_pkg)
-        p_rate = pkg_rate(selected_pkg)
-        p_desc = pkg_specialty(selected_pkg)
+    if session_id not in _interactive_flows:
+        raise HTTPException(404, "Session not found")
         
-        step_idx = len(flow.steps)
-        step = SearchStep(step_idx, "Main Package Selected", "Exact package selected.", [
-            {"id": f"package_{opt_val}", "label": p_label, "description": p_desc, "rate": p_rate}
-        ])
-        flow.add_step(step)
-        flow.set_selection(step_idx, {"id": f"package_{opt_val}"})
-        flow.current_step += 1
-        
-    ok = await _advance_pro_dynamic_flow(session_id, depth=0)
-    if not ok:
-        flow.current_step -= 1
-        # Revert the selections_list to allow retry
-        if _interactive_flows[session_id].get("selections_list"):
-            _interactive_flows[session_id]["selections_list"].pop()
-        return SelectionResponse(success=False, message="AI Engine overloaded due to API rate limits. Please wait a few seconds and try again.")
-
+    session_data = _interactive_flows[session_id]
     
-    if flow.flow_complete:
-        final = await _build_final_recommendation(flow, all_pkgs)
-        flow.final_recommendation = final
-        return SelectionResponse(success=True, message="Search complete!", flow_complete=True, final_recommendation=final)
-
-    step = flow.steps[flow.current_step] if flow.current_step < len(flow.steps) else None
-    if not step:
-        return SelectionResponse(success=True, message="Flow completed.", flow_complete=True)
-    return SelectionResponse(success=True, message="Selection received.", next_step=_step_to_response(step))
+    # 1. Match the user's manual selection against the current step options
+    current_step = flow.steps[flow.current_step]
+    selected_option = None
+    if selection.option_id.startswith("manual_add"):
+        selected_option = {
+            "id": selection.option_id,
+            "manual_package": selection.manual_package
+        }
+    else:
+        for opt in current_step.options:
+            if opt.get("id") == selection.option_id:
+                selected_option = opt
+                break
+                
+    if not selected_option:
+        raise HTTPException(400, "Invalid option ID")
+        
+    # 2. Process the manual selection
+    from tools.smart_search_flow import process_step_selection
+    sels = session_data.get("selections_list", [])
+    
+    if not any(s.get("id") == selected_option["id"] for s in sels):
+        sels.append({
+            "id": selected_option["id"],
+            "notes": "User selected",
+            "manual_package": selection.manual_package
+        })
+    session_data["selections_list"] = sels
+    
+    success, err = process_step_selection(flow, selected_option, all_pkgs)
+    if not success:
+        sels.pop()
+        session_data["selections_list"] = sels
+        raise HTTPException(400, err or "Validation failed")
+        
+    request_data = session_data["request"]
+    _sync_session_db(session_id, flow, sels, pt_type=request_data.get("patient_type", ""), scheme=request_data.get("scheme", ""))
+    
+    _auto_advance_single_option_steps(flow, all_pkgs)
+    
+    # 3. Call auto-advance for the remaining steps and translate to SelectionResponse
+    res = await _advance_pro_standard_flow(session_id)
+    if res.status == "complete":
+        return SelectionResponse(
+            success=True,
+            message=res.message,
+            flow_complete=True,
+            final_recommendation=res.final_recommendation
+        )
+    else:
+        return SelectionResponse(
+            success=True,
+            message=res.message,
+            next_step=res.current_step,
+            flow_complete=False
+        )
 
 @app.get("/pro-interactive-search/{session_id}/step")
 async def get_pro_current_step(session_id: str):
@@ -3444,7 +3710,36 @@ async def get_pro_flow_status(session_id: str):
 
 @app.post("/pro-interactive-search/{session_id}/undo")
 async def undo_pro_step_selection(session_id: str):
-    return await undo_step_selection(session_id)
+    flow, _, _, _ = await _get_or_reconstruct_flow(session_id)
+    from tools.smart_search_flow import undo_last_selection
+
+    sels = _interactive_flows[session_id].get("selections_list", [])
+    if not sels:
+        return JSONResponse(status_code=400, content={"success": False, "message": "Already at the first step"})
+
+    # Pop auto-selected steps first
+    while sels:
+        last_sel = sels[-1]
+        is_auto = last_sel.get("notes") == "Pro auto-selected"
+        
+        ok, msg = undo_last_selection(flow)
+        if not ok:
+            break
+        sels.pop()
+        
+        if not is_auto:
+            # We popped the last user-selected step, stop here!
+            break
+            
+    _interactive_flows[session_id]["selections_list"] = sels
+    _pt = _interactive_flows.get(session_id, {}).get("request", {}).get("patient_type", "")
+    _scheme = _interactive_flows.get(session_id, {}).get("request", {}).get("scheme", "")
+    _sync_session_db(session_id, flow, sels, pt_type=_pt, scheme=_scheme)
+
+    step = flow.steps[flow.current_step] if flow.current_step < len(flow.steps) else None
+    if not step:
+        return JSONResponse(status_code=500, content={"success": False, "message": "No current step after undo."})
+    return {"success": True, "message": "Reverted to last choice step", "current_step": _step_to_response(step).dict()}
 
 @app.post("/pro-interactive-search/{session_id}/feedback")
 async def submit_pro_feedback(session_id: str, request: Request):
