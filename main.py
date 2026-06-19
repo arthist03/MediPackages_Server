@@ -261,6 +261,132 @@ def pkg_strat(pkg: dict) -> str:
     return str(pkg.get("STRATIFICATION PACKAGE", ""))
 
 
+def parse_embedded_package(parent_pkg: dict, ref_str: str) -> dict | None:
+    ref_str = ref_str.strip()
+    if not ref_str:
+        return None
+    
+    parts = [p.strip() for p in ref_str.split('|')]
+    if not parts:
+        return None
+        
+    first_part = parts[0]
+    parent_code = pkg_code(parent_pkg).strip()
+    pattern = rf"({re.escape(parent_code)})\s*-\s*(STR\d+|IMP\d+|[A-Z0-9]+)"
+    match = re.search(pattern, first_part, re.IGNORECASE)
+    
+    if match:
+        extracted_code = f"{match.group(1)}-{match.group(2)}".replace(" ", "").upper()
+    else:
+        match_any = re.search(r"([A-Z0-9\-]+(?:STR|IMP)\d+)", first_part, re.IGNORECASE)
+        if match_any:
+            extracted_code = match_any.group(1).upper()
+        else:
+            extracted_code = first_part.split('|')[0].strip().split()[0]
+            
+    extracted_code = extracted_code.strip("- ").replace(" ", "")
+    
+    clean_first = first_part
+    if match:
+        clean_first = first_part[match.end():].strip("- ")
+    elif extracted_code in first_part:
+        clean_first = first_part.replace(extracted_code, "").strip("- ")
+        
+    names = []
+    if clean_first:
+        names.append(clean_first)
+    if len(parts) > 1 and parts[1]:
+        names.append(parts[1])
+        
+    name = " - ".join(names) if names else first_part
+    
+    rate = 0.0
+    rate_match = re.search(r"\(RATE\s*:\s*([\d\.]+)\)", ref_str, re.IGNORECASE)
+    if rate_match:
+        rate = float(rate_match.group(1))
+    else:
+        rate_match2 = re.search(r"RATE\s*:\s*([\d\.]+)", ref_str, re.IGNORECASE)
+        if rate_match2:
+            rate = float(rate_match2.group(1))
+            
+    category = "Regular"
+    for part in parts:
+        if part.startswith('[') and part.endswith(']'):
+            cat_name = part[1:-1].strip()
+            if "ADD" in cat_name.upper():
+                category = "Add On"
+            elif "REGULAR" in cat_name.upper():
+                category = "Regular"
+            elif "IMPLANT" in cat_name.upper():
+                category = "Implant"
+            elif "STRATIFICATION" in cat_name.upper():
+                category = "Stratification"
+                
+    if "STR" in extracted_code:
+        category = "Stratification"
+    elif "IMP" in extracted_code:
+        category = "Implant"
+        
+    return {
+        "PACKAGE CODE": extracted_code,
+        "PACKAGE NAME": name,
+        "RATE": rate,
+        "PACKAGE CATEGORY": category,
+        "SPECIALITY": parent_pkg.get("SPECIALITY", ""),
+        "PRE AUTH DOCUMENT": parent_pkg.get("PRE AUTH DOCUMENT", parent_pkg.get("Mandatory Documents", "")),
+        "CLAIM DOCUMENT": parent_pkg.get("CLAIM DOCUMENT", parent_pkg.get("Mandatory Documents - Claim Processing", "")),
+        "GOVT RESERVE": parent_pkg.get("GOVT RESERVE", "NO"),
+        "IMPLANT": "NO",
+        "STRATIFICATION PACKAGE": "NO",
+        "_source": parent_pkg.get("_source", "maa"),
+        "parent_code": parent_code
+    }
+
+
+def _get_package_by_code(code: str, all_packages: list[dict]) -> dict:
+    if not code:
+        return {}
+    code = code.strip().upper()
+    
+    for p in all_packages:
+        if pkg_code(p).strip().upper() == code:
+            return p
+            
+    parent_code = ""
+    if "-STR" in code:
+        parent_code = code.split("-STR")[0].strip()
+    elif "-IMP" in code:
+        parent_code = code.split("-IMP")[0].strip()
+        
+    if parent_code:
+        parent_pkg = None
+        for p in all_packages:
+            if pkg_code(p).strip().upper() == parent_code:
+                parent_pkg = p
+                break
+                
+        if parent_pkg:
+            strat_field = pkg_strat(parent_pkg)
+            implant_field = pkg_implant_field(parent_pkg)
+            
+            sub_strs = []
+            if strat_field and strat_field.upper() not in ["NO", "NO STRATIFICATION", "N"]:
+                sub_strs.extend(strat_field.split(';'))
+            if implant_field and implant_field.upper() not in ["NO", "NO IMPLANT", "N"]:
+                sub_strs.extend(implant_field.split(';'))
+                
+            for sub_str in sub_strs:
+                sub_str = sub_str.replace('\r', ' ').replace('\n', ' ').strip()
+                if not sub_str:
+                    continue
+                parsed = parse_embedded_package(parent_pkg, sub_str)
+                if parsed and parsed.get("PACKAGE CODE") == code:
+                    return parsed
+
+    return {}
+
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # TEXT NORMALISATION & SPELLING
 # ═══════════════════════════════════════════════════════════════════════
@@ -2628,7 +2754,7 @@ async def _build_final_recommendation(flow: Any, packages: list[dict]) -> dict:
         if not sel_code or "skip" in sel_id.lower():
             continue
 
-        pkg = code_to_pkg.get(sel_code)
+        pkg = code_to_pkg.get(sel_code) or _get_package_by_code(sel_code, packages)
         if not pkg:
             continue
         e = _entry(pkg)
@@ -3456,10 +3582,7 @@ async def recalculate_pro_recommendation(req: RecalculateRequest):
         
     _load_packages_cache()
     def get_full_package(code: str) -> dict:
-        for p in _all_packages_cache:
-            if pkg_code(p) == code:
-                return p
-        return {}
+        return _get_package_by_code(code, _all_packages_cache)
 
     def _entry(p: dict) -> dict:
         return {
